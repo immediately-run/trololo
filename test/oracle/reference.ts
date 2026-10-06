@@ -132,7 +132,8 @@ function before(a: Op, b: Op): boolean {
 // ---- §15.5 batch files ----------------------------------------------------------------------
 
 function readBatch(path: string, bytes: Uint8Array, acked: boolean): Batch | null {
-  const m = /^batches\/([A-Za-z0-9-]{1,39}\.[0-9a-z]{8}\.[0-9a-z]{8})\/([1-9][0-9]*)\.json$/.exec(path);
+  // §15.5: `<seq>` is a positive integer of at most 15 digits; any other path is not a batch file.
+  const m = /^batches\/([A-Za-z0-9-]{1,39}\.[0-9a-z]{8}\.[0-9a-z]{8})\/([1-9][0-9]{0,14})\.json$/.exec(path);
   if (!m) return null;
   const actor = m[1];
   const seq = Number(m[2]);
@@ -339,12 +340,21 @@ export function oracle(input: OracleInput): OracleResult {
   const { layout, sessionId, offered } = input;
 
   // Slots: one batch per (actor, seq); the replica keeps the first version it saw.
+  // §15.5 "An exhausted log": among EVERY version read (not only the kept ones), a well-formed
+  // version at the lamport ceiling, or two different versions of one slot, implies the start-base
+  // freeze. It depends on the set of versions read and nothing else.
+  const CEILING = 2 ** 48 - 1;
   const slots = new Map<string, Batch>();
+  let implied = false;
   for (const f of input.batches) {
     const b = readBatch(f.path, f.bytes, f.acked);
     if (!b) continue;
-    if (!slots.has(b.key)) slots.set(b.key, b);
+    if (b.body && b.body.lamport === CEILING) implied = true;
+    const kept = slots.get(b.key);
+    if (!kept) slots.set(b.key, b);
+    else if (kept.hash !== b.hash) implied = true;
   }
+  const startBase = offered[0].sha;
 
   const contiguousBy = (ok: (b: Batch) => boolean): Map<string, number> => {
     const v = new Map<string, number>();
@@ -358,11 +368,11 @@ export function oracle(input: OracleInput): OracleResult {
   };
   const holding = contiguousBy(() => true);
 
-  // Frozen (§15.5): every `_session/frozen` operation of a control-only batch that holds its slot.
-  // (The freeze an exhausted log implies is OPEN — §15.5 "An exhausted log", R3-995 — so the
-  // oracle, like the engine, knows written freezes only.)
-  // The winner: a freeze that stops the chain outranks a layout freeze; then §3.8 order (a full
-  // tie is impossible for written freezes: actor+seq name the slot, index the op).
+  // Frozen (§15.5): the implied start-base freeze (computed with the slots above) when one holds;
+  // otherwise the winner among every `_session/frozen` operation of a control-only batch that holds
+  // its slot: the start-base freeze outranks everything, then a freeze that stops the chain outranks
+  // a layout freeze, then §3.8 order (a full tie is impossible for written freezes: actor+seq name
+  // the slot, index the op).
   type FreezeCand = { lamport: number; actor: string; seq: number; index: number; value: { reason: string; at: string } };
   const cands: FreezeCand[] = [];
   for (const b of slots.values()) {
@@ -374,7 +384,10 @@ export function oracle(input: OracleInput): OracleResult {
       });
     }
   }
+  const isStartBase = (c: FreezeCand): boolean => c.value.reason === 'integrity' && c.value.at === startBase;
   const beats = (x: FreezeCand, y: FreezeCand): boolean => {
+    // The start-base freeze outranks every other freeze value (§15.5).
+    if (isStartBase(x) !== isStartBase(y)) return isStartBase(x);
     const sx = x.value.reason !== 'layout';
     const sy = y.value.reason !== 'layout';
     if (sx !== sy) return sx;
@@ -385,7 +398,11 @@ export function oracle(input: OracleInput): OracleResult {
   };
   let frozenWin: FreezeCand | null = null;
   for (const c of cands) if (frozenWin === null || beats(c, frozenWin)) frozenWin = c;
-  const frozen = frozenWin ? { reason: frozenWin.value.reason, at: frozenWin.value.at } : null;
+  const frozen = implied
+    ? { reason: 'integrity', at: startBase }
+    : frozenWin
+      ? { reason: frozenWin.value.reason, at: frozenWin.value.at }
+      : null;
   const stops = frozen !== null && frozen.reason !== 'layout';
 
   // §15.5 the stop: under a freeze that stops the chain, the chain ends at its last commit that is an
