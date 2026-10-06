@@ -4,7 +4,7 @@
 
 import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
-import { cmp, type Op } from '../../src/lib/session/batch';
+import { batchPath, cmp, encodeBatch, LAMPORT_LIMIT, type BatchBody, type Op } from '../../src/lib/session/batch';
 import type { Json } from '../../src/lib/session/canonical';
 import { frozenOp, termsOp } from '../../src/lib/session/control';
 import { SessionEngine, type OutgoingBatch } from '../../src/lib/session/engine';
@@ -78,6 +78,10 @@ export class Replica {
    * head it last synced.
    */
   seen = new Map<string, Uint8Array>();
+  /** Later, different versions of a path already in `seen`, in reading order (§15.5 "An exhausted log" reads every version). */
+  extra: Array<{ path: string; bytes: Uint8Array }> = [];
+  /** It was served a version out of band — one the space may not store. */
+  unstored = false;
   acked = new Set<string>();
   syncedHead = '';
 
@@ -169,16 +173,24 @@ export class World {
     r.unresolved = [];
     r.inbox = [];
     r.seen = fresh.seen;
+    r.extra = fresh.extra;
+    r.unstored = false; // a reload reads the space only
     r.acked = fresh.acked;
     r.syncedHead = fresh.syncedHead;
     this.reloads++;
   }
 
   see(r: Replica, path: string, bytes: Uint8Array, acked: boolean): void {
-    // First version read keeps the slot — the same reading the engine and the §15.6 rule make;
-    // later versions are the integrity failure the engine detects and freezes on (the freeze then
-    // reaches the oracle as a written `_session/frozen` op like any other).
-    if (!r.seen.has(path)) r.seen.set(path, bytes);
+    // First version read keeps the slot — the same reading the engine and the §15.6 rule make.
+    // A later, different version is kept too, apart: §15.5 derives the implied freeze from every
+    // version a replica reads, so the oracle must see them all.
+    const first = r.seen.get(path);
+    if (!first) r.seen.set(path, bytes);
+    else if (!sameBytes(first, bytes)) {
+      // Reading another version acknowledges nothing: the slot is acknowledged by its own bytes.
+      if (!r.extra.some((x) => x.path === path && sameBytes(x.bytes, bytes))) r.extra.push({ path, bytes });
+      return;
+    }
     if (acked) r.acked.add(path);
   }
 
@@ -272,7 +284,7 @@ export class World {
       sessionId: SESSION_ID,
       offered: this.chainFromStart(r.syncedHead),
       isAncestor: (a, d) => this.git.reaches(a, d),
-      batches: [...r.seen].map(([path, bytes]) => ({ path, bytes, acked: r.acked.has(path) })),
+      batches: [...r.seen, ...r.extra.map((x) => [x.path, x.bytes] as const)].map(([path, bytes]) => ({ path, bytes, acked: r.acked.has(path) })),
     });
   }
 
@@ -362,9 +374,40 @@ export class World {
   }
 
   /** After quiescence every replica derives the same state, and it is the oracle's. */
+  /** The versions a replica has read, as a comparable key: every path with every version's hash. */
+  readSet(r: Replica): string {
+    const hex = (b: Uint8Array) => Buffer.from(b).toString('base64');
+    return [...[...r.seen].map(([p, b]) => `${p} ${hex(b)}`), ...r.extra.map((x) => `${x.path} ${hex(x.bytes)}`)].sort().join('\n');
+  }
+
+  /**
+   * Replicas that have read the same versions and synced the same head derive the same freeze and
+   * the same chain (§15.5; R3-995's exit criterion) — whatever order they read them in, and
+   * whichever version keeps a slot. Returns the number of replica groups, for coverage.
+   */
+  checkSameSets(): number {
+    const groups = new Map<string, Replica[]>();
+    for (const r of this.replicas) {
+      const k = `${this.readSet(r)}\n@${r.syncedHead}`;
+      groups.set(k, [...(groups.get(k) ?? []), r]);
+    }
+    for (const [, [first, ...rest]] of groups) {
+      for (const r of rest) {
+        assert.deepEqual(r.engine.frozen(), first.engine.frozen(), `replica ${r.name} freezes unlike ${first.name}, having read the same batches`);
+        assert.deepEqual(r.engine.adoptedChain(), first.engine.adoptedChain(), `replica ${r.name} stops unlike ${first.name}, having read the same batches`);
+      }
+    }
+    return groups.size;
+  }
+
   checkConverged(): void {
-    const [first, ...rest] = this.replicas;
     for (const r of this.replicas) this.check(r);
+    this.checkSameSets();
+    // Replicas served a version the space does not store have read different batches; past the
+    // freeze and chain (checked above, within same-read groups), only the replicas with no such
+    // version must agree on everything.
+    const plain = this.replicas.filter((r) => r.extra.length === 0 && !r.unstored);
+    const [first, ...rest] = plain;
     const sig = (r: Replica) => ({
       adopted: r.engine.adoptedChain(),
       frozen: r.engine.frozen(),
@@ -375,6 +418,70 @@ export class World {
       view: r.engine.view(),
     });
     for (const r of rest) assert.deepEqual(sig(r), sig(first), `replica ${r.name} diverges from ${first.name}`);
+  }
+
+  // ---- the exhausted-log class (§15.5, R3-995): ceiling batches and second versions ---------
+
+  /** Ceiling batches and second versions planted, and how many were served to some replicas only. */
+  ceilingPlants = 0;
+  secondVersions = 0;
+  splitServes = 0;
+
+  /** A forger's well-formed batch file (an actor outside the session), seq 1. */
+  forgedBatch(lamport: number, base: string, title: string): { path: string; bytes: Uint8Array } {
+    const actor = `mal.${this.randomId(8)}.${this.randomId(8)}`;
+    const body: BatchBody = {
+      v: 1,
+      actor,
+      seq: 1,
+      lamport,
+      base,
+      prev: '',
+      time: '2026-10-06T12:00:00.000Z',
+      ops: [{ path: `cards/${CARDS[this.int(CARDS.length)]}.json`, group: 'title', value: title }],
+    };
+    return { path: batchPath(actor, 1), bytes: encodeBatch(body) };
+  }
+
+  /** Serves a version out of band (not through the create-only space) to a random proper subset, or to everyone. */
+  private async serve(path: string, bytes: Uint8Array, everyone: boolean): Promise<void> {
+    const targets = everyone ? [...this.replicas] : this.replicas.filter(() => this.rng() < 0.5);
+    if (!everyone && (targets.length === 0 || targets.length === this.replicas.length)) {
+      targets.splice(0, targets.length, this.replicas[this.int(this.replicas.length)]);
+    }
+    if (!everyone) this.splitServes++;
+    for (const r of targets) {
+      r.unstored = true;
+      await this.receiveNow(r, path, bytes);
+    }
+  }
+
+  /** A well-formed batch at the lamport ceiling (§3.8): stored in the space, or served to some replicas only. */
+  async plantCeiling(): Promise<void> {
+    this.ceilingPlants++;
+    const chain = this.firstParentChain(this.git.main);
+    const b = this.forgedBatch(LAMPORT_LIMIT - 1, this.pick(chain)!.sha, `Ceiling ${this.int(9)}`);
+    if (this.rng() < 0.5) this.plant(b.path, b.bytes);
+    else await this.serve(b.path, b.bytes, false);
+  }
+
+  /**
+   * A second version of a batch file the space already stores — another title, and half the time
+   * the ceiling lamport — served out of band, since the create-only space keeps one version per path.
+   */
+  async plantSecondVersion(): Promise<void> {
+    const paths = [...this.space.keys()].filter((p) => p.startsWith('batches/'));
+    const path = this.pick(paths);
+    if (!path) return;
+    const body = JSON.parse(new TextDecoder().decode(this.space.get(path)!)) as BatchBody;
+    if (!body || !Array.isArray(body.ops)) return;
+    this.secondVersions++;
+    const alt: BatchBody = {
+      ...body,
+      lamport: this.rng() < 0.5 ? LAMPORT_LIMIT - 1 : body.lamport,
+      ops: [{ path: `cards/${CARDS[this.int(CARDS.length)]}.json`, group: 'title', value: `Second ${this.int(99)}` }],
+    };
+    await this.serve(path, encodeBatch(alt), this.rng() < 0.2);
   }
 
   // ---- random activity -------------------------------------------------------------------
@@ -575,4 +682,10 @@ function oracleBoard(o: OracleResult): ReturnType<typeof boardOf> {
   const out: ReturnType<typeof boardOf> = {};
   for (const path of [...o.effective.keys()].sort(cmp)) out[path] = { exists: o.effective.get(path)!.exists, values: { ...o.effective.get(path)!.values } };
   return out;
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }

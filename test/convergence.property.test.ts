@@ -34,6 +34,10 @@ interface Coverage {
   twoRewriteRuns: number;
   stopOffChainRuns: number;
   mixedBatches: number;
+  ceilingRuns: number;
+  secondVersionRuns: number;
+  splitRuns: number;
+  sameSetGroupsSplit: number;
 }
 
 /** The `at` of a freeze that stops the chain, as some replica holds it: what a second rewrite removes. */
@@ -50,6 +54,7 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
   // A layout change or a rewrite freezes the session for good; keep at most two per run, in the
   // last third, so most of a run exercises a live session and some runs rewrite twice (§15.5 the stop).
   let freezers = 0;
+  let plants = 0;
   for (const [i, a] of actions.entries()) {
     const r = rs[w.int(rs.length)];
     const late = i >= (actions.length * 2) / 3;
@@ -79,6 +84,13 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
     }
     else if (a < 91) r.online = !r.online;
     else if (a === 91) await w.reload(r);
+    else if ((a === 94 || a === 95) && late && plants < 1 && w.rng() < 0.6) {
+      // The exhausted-log class (§15.5, R3-995): a ceiling batch, or a second version of a stored
+      // batch file, stored or served to some replicas only. Rare, late, at most one per run.
+      plants++;
+      if (a === 94) await w.plantCeiling();
+      else await w.plantSecondVersion();
+    }
     else if (a === 92 || a === 93) {
       if (late && freezers < 2) {
         freezers++;
@@ -103,6 +115,10 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
     if (w.rewrites === 2) cov.twoRewriteRuns++;
     if (w.stopOffChain) cov.stopOffChainRuns++;
     cov.mixedBatches += w.mixed;
+    if (w.ceilingPlants) cov.ceilingRuns++;
+    if (w.secondVersions) cov.secondVersionRuns++;
+    if (w.splitServes) cov.splitRuns++;
+    if (w.checkSameSets() > 1) cov.sameSetGroupsSplit++;
   }
   return w;
 }
@@ -113,7 +129,7 @@ describe('convergence', () => {
   });
 
   it(`random sessions converge to the oracle (${RUNS} runs)`, async () => {
-    const cov: Coverage = { publishes: 0, conflicts: 0, merges: 0, reloads: 0, supersededRuns: 0, unfrozenRuns: 0, frozenRuns: 0, twoFreezeRuns: 0, twoRewriteRuns: 0, stopOffChainRuns: 0, mixedBatches: 0 };
+    const cov: Coverage = { publishes: 0, conflicts: 0, merges: 0, reloads: 0, supersededRuns: 0, unfrozenRuns: 0, frozenRuns: 0, twoFreezeRuns: 0, twoRewriteRuns: 0, stopOffChainRuns: 0, mixedBatches: 0, ceilingRuns: 0, secondVersionRuns: 0, splitRuns: 0, sameSetGroupsSplit: 0 };
     await fc.assert(
       fc.asyncProperty(
         fc.integer({ min: 1, max: 2 ** 31 - 1 }),
@@ -141,6 +157,12 @@ describe('convergence', () => {
     expect(cov.stopOffChainRuns).toBeGreaterThan(RUNS / 250);
     // Mixed content+control batches, a freeze mid-batch (§15.5: their control operations are inert).
     expect(cov.mixedBatches).toBeGreaterThan(RUNS / 4);
+    // The exhausted-log class (§15.5, R3-995): ceiling batches and second versions, and runs
+    // where replicas end having read different versions.
+    expect(cov.ceilingRuns).toBeGreaterThan(RUNS / 50);
+    expect(cov.secondVersionRuns).toBeGreaterThan(RUNS / 50);
+    expect(cov.splitRuns).toBeGreaterThan(RUNS / 50);
+    expect(cov.sameSetGroupsSplit).toBeGreaterThan(RUNS / 100);
     console.info('convergence coverage', cov);
   });
 });

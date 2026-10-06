@@ -2,11 +2,11 @@
 
 import { describe, expect, it } from 'vitest';
 import { batchPath, encodeBatch, LAMPORT_LIMIT, type BatchBody } from '../src/lib/session/batch';
-import { bootstrapFiles, LamportExhausted, NotReadyError, SessionEngine } from '../src/lib/session/engine';
+import { bootstrapFiles, FrozenError, LamportExhausted, NotReadyError, SessionEngine } from '../src/lib/session/engine';
 import { frozenOp, termsOp } from '../src/lib/session/control';
 import { layoutFromMarker } from '../src/lib/session/layout';
 import { outsideEdit, place, sendTo, settle, titleOf } from './sim/helpers';
-import { CARDS, COLUMNS, hash, LAYOUT, MARKER, SESSION_ID, World } from './sim/world';
+import { CARDS, COLUMNS, hash, LAYOUT, MARKER, SESSION_ID, World, type Replica } from './sim/world';
 
 const [X, Y] = CARDS;
 const decode = (b: Uint8Array) => JSON.parse(new TextDecoder().decode(b)) as BatchBody;
@@ -189,7 +189,7 @@ describe('review regressions (PR #1)', () => {
     expect(a.engine.pending().map((p) => p.group).sort()).toEqual(['created', 'createdBy', 'position', 'title']);
   });
 
-  it('refuses to issue once the lamport space is exhausted, with the typed LamportExhausted (§15.5; the exhausted-log freeze itself is OPEN, R3-995)', async () => {
+  it('a ceiling read freezes at the start base, and an exhausted replica refuses even a control batch with the typed LamportExhausted (§15.5)', async () => {
     const w = new World(316);
     const a = await w.join('ana');
     const b = await w.join('ben');
@@ -197,9 +197,11 @@ describe('review regressions (PR #1)', () => {
     const top = encodeBatch({ ...one, lamport: LAMPORT_LIMIT - 1 });
     // Ben reads a batch at the top of the lamport range (here, a rewritten copy of Ana's first).
     await w.receiveNow(b, batchPath(one.actor, 1), top);
-    // No freeze is implied from a ceiling read (the rule is open) — but no batch can be issued.
-    expect(b.engine.frozen()).toBeNull();
-    await expect(b.engine.renameCard(X, 'y')).rejects.toBeInstanceOf(LamportExhausted);
+    // A ceiling read implies the start-base freeze (§15.5 "An exhausted log"): content is refused
+    // as frozen, and a control batch finds no lamport left.
+    expect(b.engine.frozen()).toEqual({ reason: 'integrity', at: w.root });
+    expect(b.engine.adoptedChain()).toEqual([w.root]);
+    await expect(b.engine.renameCard(X, 'y')).rejects.toBeInstanceOf(FrozenError);
     await expect(b.engine.setTerms('no lamport left')).rejects.toBeInstanceOf(LamportExhausted);
     w.check(b);
   });
@@ -239,7 +241,7 @@ describe('review regressions, round two (PR #2, kept by R3-992)', () => {
   });
 });
 
-describe('R3-992: the freeze stop (§15.5 — the stop; the exhausted-log rule is OPEN, R3-995)', () => {
+describe('R3-992: the freeze stop (§15.5 — the stop)', () => {
   /** Ana adopts x1 and x2 while Ben is offline; a force-push drops x2 (Ana freezes at x1); a second drops x1. */
   async function twoRewrites(seed: number) {
     const w = new World(seed);
@@ -439,5 +441,135 @@ describe('R3-998: control operations in a mixed batch are inert (§15.5)', () =>
       expect(r.engine.frozen()).toBeNull();
       expect(titleOf(r.engine, X)).not.toBe('Must not apply');
     }
+  });
+});
+
+describe('R3-995: an exhausted log and a slot read in two versions freeze at the start base (§15.5)', () => {
+  /** A forger's well-formed seq-1 batch for `actor`, carrying one title op. */
+  const fv = (actor: string, base: string, lamport: number, title: string) => {
+    const body: BatchBody = { v: 1, actor, seq: 1, lamport, base, prev: '', time: '2026-10-06T12:00:00.000Z', ops: [{ path: `cards/${X}.json`, group: 'title', value: title }] };
+    return { path: batchPath(actor, 1), bytes: encodeBatch(body) };
+  };
+  const SLOT = 'mal.aaaaaaaa.cccccccc';
+  const OTHER = 'mal.aaaaaaaa.bbbbbbbb';
+  /** Two replicas that have both adopted [root, x1]. */
+  const twoOnX1 = async (seed: number) => {
+    const w = new World(seed);
+    const a = await w.join('ana');
+    const b = await w.join('ben');
+    const root = w.git.main;
+    const x1 = outsideEdit(w, `cards/${Y}.json`, { title: 'x1' });
+    await w.sync(a);
+    await w.sync(b);
+    return { w, a, b, root, x1 };
+  };
+  /** Every replica holds the start-base freeze, stopped at the start base, and agrees with its oracle. */
+  const allStartBase = (w: World, rs: Replica[]) => {
+    for (const r of rs) {
+      w.check(r);
+      expect(r.engine.frozen()).toEqual({ reason: 'integrity', at: w.root });
+      expect(r.engine.adoptedChain()).toEqual([w.root]);
+    }
+  };
+
+  it('round 1: two versions of a slot, one at the ceiling — whichever a replica read first, both freeze alike', async () => {
+    const { w, a, b, root } = await twoOnX1(995);
+    const v1 = fv(SLOT, root, 50, 'one');
+    const v2 = fv(SLOT, root, LAMPORT_LIMIT - 1, 'two');
+    await w.receiveNow(a, v1.path, v1.bytes);
+    await w.receiveNow(b, v2.path, v2.bytes);
+    await w.receiveNow(a, v2.path, v2.bytes);
+    await sendTo(w, a, b);
+    allStartBase(w, [a, b]);
+  });
+
+  it('round 2: the stored lower version and an unstored ceiling one — the detector announces, so a joiner and a reload freeze too', async () => {
+    const { w, a, b, root } = await twoOnX1(1995);
+    const v1 = fv(SLOT, root, 50, 'one');
+    const v2 = fv(SLOT, root, LAMPORT_LIMIT - 1, 'two');
+    w.plant(v1.path, v1.bytes);
+    await w.receiveNow(a, v1.path, v1.bytes);
+    await w.receiveNow(b, v2.path, v2.bytes);
+    await w.receiveNow(a, v2.path, v2.bytes); // Ana kept v1, so she can still write: she announces
+    w.collect(a);
+    expect(a.journal.length).toBe(1); // the start-base freeze
+    await sendTo(w, a, b);
+    w.write(a);
+    w.resolve(a);
+    const carl = await w.join('carl');
+    await w.reload(a);
+    await expect(carl.engine.renameCard(X, 'carl edits')).rejects.toBeInstanceOf(FrozenError);
+    allStartBase(w, [a, b, carl]);
+  });
+
+  it('P1: an announcement and a third ceiling batch in the space — space readers and ceiling readers agree', async () => {
+    const { w, a, b, root, x1 } = await twoOnX1(2995);
+    const v1 = fv(SLOT, root, 50, 'one');
+    const v2 = fv(SLOT, root, LAMPORT_LIMIT - 1, 'two');
+    const c = fv(OTHER, x1, LAMPORT_LIMIT - 1, 'c');
+    w.plant(v1.path, v1.bytes);
+    await w.receiveNow(a, v1.path, v1.bytes);
+    await w.receiveNow(b, v2.path, v2.bytes);
+    await w.receiveNow(a, v2.path, v2.bytes);
+    w.plant(c.path, c.bytes);
+    for (const r of [a, b]) await w.receiveNow(r, c.path, c.bytes);
+    await sendTo(w, a, b);
+    w.write(a);
+    w.resolve(a);
+    const carl = await w.join('carl');
+    await w.reload(a);
+    allStartBase(w, [a, b, carl]);
+  });
+
+  it('P2: two ceiling versions of one slot with different bases, the lesser stored — every reader agrees', async () => {
+    const { w, a, b, root, x1 } = await twoOnX1(3995);
+    const stored = fv(SLOT, root, LAMPORT_LIMIT - 1, 'stored');
+    const unstored = fv(SLOT, x1, LAMPORT_LIMIT - 1, 'unstored');
+    w.plant(stored.path, stored.bytes);
+    await w.receiveNow(a, stored.path, stored.bytes);
+    await w.receiveNow(b, stored.path, stored.bytes);
+    await w.receiveNow(b, unstored.path, unstored.bytes);
+    const carl = await w.join('carl');
+    allStartBase(w, [a, b, carl]);
+  });
+
+  it('P3: a reader exhausted by another ceiling batch cannot announce, and still every reader agrees', async () => {
+    const { w, a, b, root, x1 } = await twoOnX1(4995);
+    const c = fv(OTHER, x1, LAMPORT_LIMIT - 1, 'c');
+    w.plant(c.path, c.bytes);
+    for (const r of [a, b]) await w.receiveNow(r, c.path, c.bytes);
+    const v1 = fv(SLOT, root, 50, 'one');
+    const v2 = fv(SLOT, root, LAMPORT_LIMIT - 1, 'two');
+    w.plant(v1.path, v1.bytes);
+    await w.receiveNow(a, v1.path, v1.bytes);
+    const before = a.journal.length;
+    await w.receiveNow(a, v2.path, v2.bytes); // exhausted by c: Ana writes nothing
+    expect(a.journal.length).toBe(before);
+    await w.quiesce();
+    const carl = await w.join('carl');
+    allStartBase(w, [a, b, carl]);
+  });
+
+  it('the announcement is written even when another stop freeze is in force, and outranks one ranked above it in §3.8', async () => {
+    const { w, a, b, root, x1 } = await twoOnX1(5995);
+    // A written rewrite freeze at x1 is in force first.
+    const rw1 = encodeBatch({ v: 1, actor: OTHER, seq: 1, lamport: 900, base: root, prev: '', time: '2026-10-06T12:00:00.000Z', ops: [frozenOp('rewrite', x1)] });
+    w.plant(batchPath(OTHER, 1), rw1);
+    await w.quiesce();
+    for (const r of [a, b]) expect(r.engine.frozen()).toEqual({ reason: 'rewrite', at: x1 });
+    // Ana reads a plain second version (no ceiling at all) and announces anyway.
+    const v1 = fv(SLOT, root, 50, 'one');
+    const v2 = fv(SLOT, root, 51, 'two');
+    w.plant(v1.path, v1.bytes);
+    await w.receiveNow(a, v1.path, v1.bytes);
+    await w.receiveNow(a, v2.path, v2.bytes);
+    await w.quiesce();
+    // Then a rewrite freeze ranked far above the announcement in §3.8 order: the start-base freeze
+    // still wins for a replica that knows only the space.
+    const later = 'mal.aaaaaaaa.dddddddd';
+    w.plant(batchPath(later, 1), encodeBatch({ v: 1, actor: later, seq: 1, lamport: 2 ** 47, base: root, prev: '', time: '2026-10-06T12:00:00.000Z', ops: [frozenOp('rewrite', x1)] }));
+    await w.quiesce();
+    const carl = await w.join('carl');
+    allStartBase(w, [a, b, carl]);
   });
 });
