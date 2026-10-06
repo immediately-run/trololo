@@ -85,7 +85,7 @@ export interface PublishPlan {
 
 export class FrozenError extends Error {}
 export class NotReadyError extends Error {}
-/** A batch at the §3.8 lamport ceiling has been read, so no further batch can be issued (§15.5, an exhausted log). */
+/** This replica keeps a batch at the §3.8 lamport ceiling, so no further batch can be issued (§15.5, an exhausted log). */
 export class LamportExhausted extends Error {
   constructor() {
     super('the lamport space is exhausted; restart the session');
@@ -138,6 +138,10 @@ export class SessionEngine {
   private logRead = false;
   private readonly freezeIssued = new Set<FreezeReason>();
   private deferredFreezes: Frozen[] = [];
+  /** An exhaustion this replica must announce once the log has been read (§15.5, announcing it). */
+  private deferredAnnounce = false;
+  /** The last stop computed on a refused ancestry question; a poll of an unchanged head settles again to retry it. */
+  private stopUnanswered = false;
   private outbox: OutgoingBatch[] = [];
   private readonly dismissed = new Set<string>();
   private lock: Promise<unknown> = Promise.resolve();
@@ -170,6 +174,7 @@ export class SessionEngine {
       // Conditions found while reading (an integrity failure, a layout change) freeze now.
       const deferred = this.deferredFreezes;
       this.deferredFreezes = [];
+      if (this.deferredAnnounce) await this.announceExhaustion();
       for (const f of deferred) await this.freeze(f.reason, f.at);
       await this.settle();
     });
@@ -205,7 +210,10 @@ export class SessionEngine {
       if (!this.logRead) return; // a freeze may be needed, and nothing can be written yet
       const history = this.history;
       const head = await history.head();
-      if (head === this.walkedHead || head === this.offered[this.offered.length - 1].sha) return;
+      if (head === this.walkedHead || head === this.offered[this.offered.length - 1].sha) {
+        if (this.stopUnanswered) await this.settle(); // nothing new to walk, but the stop is still to be asked
+        return;
+      }
       // Walk the head's first-parent chain (§5.3) back to a commit we were already offered.
       const known = new Map(this.offered.map((c, i) => [c.sha, i]));
       const fresh: LogEntry[] = [];
@@ -555,13 +563,11 @@ export class SessionEngine {
   private async ingest(path: string, bytes: Uint8Array, hash: string, acked: boolean): Promise<void> {
     const r = decodeBatch(path, bytes, hash);
     if (!parseBatchPath(path)) return; // not a batch file: occupies no slot
-    if (r.body) {
-      // Every version read counts toward the lamport ceiling, a conflicting second version of a slot
-      // included (§15.5, an exhausted log): nobody can write after it, so it implies the freeze itself.
-      this.lamportMax = Math.max(this.lamportMax, r.body.lamport);
-      if (r.body.lamport === LAMPORT_LIMIT - 1) {
-        this.control.applyExhausted({ lamport: r.body.lamport, actor: r.actor, seq: r.seq, index: r.body.ops.length }, r.body.base);
-      }
+    const atCeiling = r.body !== null && r.body.lamport === LAMPORT_LIMIT - 1;
+    if (atCeiling) {
+      // §15.5, an exhausted log: every version read at the ceiling implies the freeze, a conflicting
+      // second version of a slot included.
+      this.control.applyExhausted({ lamport: r.body!.lamport, actor: r.actor, seq: r.seq, index: r.body!.ops.length }, r.body!.base);
     }
     const existing = this.slot(r.actor, r.seq);
     if (existing) {
@@ -569,13 +575,18 @@ export class SessionEngine {
         if (acked) this.acked.add(r.key);
         return;
       }
-      await this.freeze('integrity', this.fold.head.sha);
+      // A second version of a slot: an integrity failure. If the losing version is the one at the
+      // ceiling, readers of the space may never see it, so announce its freeze (§15.5).
+      if (atCeiling && existing.body?.lamport !== LAMPORT_LIMIT - 1) await this.announceExhaustion();
+      else await this.freeze('integrity', this.fold.head.sha);
       return;
     }
     let seqs = this.slots.get(r.actor);
     if (!seqs) this.slots.set(r.actor, (seqs = new Map()));
     seqs.set(r.seq, r);
     if (acked) this.acked.add(r.key);
+    // Only the version that keeps the slot spends lamport space (§15.5): a losing one never raises ours.
+    if (r.body) this.lamportMax = Math.max(this.lamportMax, r.body.lamport);
     if (!r.body) {
       this.states.set(r.key, 'invalid');
       this.reasons.set(r.key, r.shapeError ?? 'invalid');
@@ -606,11 +617,13 @@ export class SessionEngine {
       if (key === '') {
         this.stopIndex = Infinity;
         this.stopKey = key;
+        this.stopUnanswered = false;
       } else {
         const s = await this.stopOn(f!.at);
         this.stopIndex = s.index;
         // An answer built on a refused ancestry question is used now and asked again next time.
         if (s.answered) this.stopKey = key;
+        this.stopUnanswered = !s.answered;
       }
     }
     if (this.stopIndex >= this.fold.chain.length - 1) return false;
@@ -774,7 +787,30 @@ export class SessionEngine {
     this.freezeIssued.add(reason);
   }
 
-  private async issueUnlocked(ops: readonly Op[]): Promise<OutgoingBatch> {
+  /**
+   * §15.5, announcing it: this replica kept a version below the ceiling and has read a losing version
+   * at it. Write one control-only batch at the ceiling whose base and only operation carry the winning
+   * implied freeze, so that a reader of the space alone freezes identically — whatever freezes are
+   * already in force, since the implied freeze outranks them on the ceiling's readers.
+   */
+  private async announceExhaustion(): Promise<void> {
+    if (!this.logRead) {
+      this.deferredAnnounce = true;
+      return;
+    }
+    this.deferredAnnounce = false;
+    const implied = this.control.impliedFrozen()!;
+    try {
+      await this.issueUnlocked([frozenOp('integrity', implied.at)], { lamport: LAMPORT_LIMIT - 1, base: implied.at });
+    } catch (err) {
+      // This replica kept another ceiling batch: whoever reads that one derives the freeze already.
+      if (err instanceof LamportExhausted) return;
+      throw err;
+    }
+    this.freezeIssued.add('integrity');
+  }
+
+  private async issueUnlocked(ops: readonly Op[], fixed?: { lamport: number; base: string }): Promise<OutgoingBatch> {
     if (!this.logRead) throw new NotReadyError('the session log has not been read in full yet');
     const content = ops.some((op) => !op.path.startsWith(CONTROL_PREFIX));
     if (content && this.frozen() !== null) throw new FrozenError(`the session is frozen (${this.frozen()!.reason})`);
@@ -784,8 +820,8 @@ export class SessionEngine {
       v: BATCH_VERSION,
       actor: this.actor,
       seq,
-      lamport: this.lamportMax + 1,
-      base: this.fold.head.sha,
+      lamport: fixed?.lamport ?? this.lamportMax + 1,
+      base: fixed?.base ?? this.fold.head.sha,
       prev: this.ownPrev,
       time: this.clock().toISOString(),
       ops,

@@ -364,7 +364,8 @@ export function oracle(input: OracleInput): OracleResult {
   // plus the freeze an exhausted log implies — any version read at lamport 2^48 − 1, a slot's losing
   // version included, counts as carrying `{integrity, its base}` after its own operations. The
   // winner: a freeze that stops the chain outranks a layout freeze; then §3.8 order; then the
-  // greater `at`.
+  // greater `at`. An announcement of an exhausted log (§15.5) is an ordinary control-only batch at the
+  // ceiling, so both rules above already cover it.
   type FreezeCand = { lamport: number; actor: string; seq: number; index: number; value: { reason: string; at: string } };
   const cands: FreezeCand[] = [];
   for (const b of slots.values()) {

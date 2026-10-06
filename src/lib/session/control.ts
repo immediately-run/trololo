@@ -51,6 +51,11 @@ export class ControlState {
     return asFrozen(win);
   }
 
+  /** The winning freeze an exhausted log implies, ignoring the written ones. */
+  impliedFrozen(): Frozen | null {
+    return asFrozen(this.implied);
+  }
+
   /** The winning freeze written to the log, ignoring one an exhausted log implies. */
   writtenFrozen(): Frozen | null {
     return asFrozen(this.winners.get(FROZEN_PATH));

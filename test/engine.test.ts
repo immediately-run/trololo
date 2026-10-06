@@ -5,7 +5,7 @@ import { batchPath, encodeBatch, LAMPORT_LIMIT, type BatchBody } from '../src/li
 import { bootstrapFiles, FrozenError, LamportExhausted, NotReadyError, SessionEngine } from '../src/lib/session/engine';
 import { layoutFromMarker } from '../src/lib/session/layout';
 import { outsideEdit, place, sendTo, settle, titleOf } from './sim/helpers';
-import { CARDS, COLUMNS, hash, LAYOUT, MARKER, SESSION_ID, World } from './sim/world';
+import { CARDS, COLUMNS, hash, LAYOUT, MARKER, SESSION_ID, World, type Replica } from './sim/world';
 
 const [X, Y] = CARDS;
 const decode = (b: Uint8Array) => JSON.parse(new TextDecoder().decode(b)) as BatchBody;
@@ -449,6 +449,106 @@ describe('R3-992: the freeze stop and the exhausted log (§15.5)', () => {
     outsideEdit(w, `cards/${X}.json`, { title: 'x2' });
     await expect(w.sync(a)).resolves.toBeUndefined(); // later inputs still settle
     expect(a.engine.adoptedChain()).toEqual([root]);
+    w.check(a);
+  });
+
+  /**
+   * After a ceiling conflict: Carl joins, Ana reloads. Every replica — those that read the ceiling
+   * version, and those that read only the space — must hold the same freeze and chain.
+   */
+  async function joinAndReload(w: World, rs: Replica[]): Promise<Replica[]> {
+    for (const r of rs) {
+      w.write(r);
+      w.resolve(r);
+    }
+    const carl = await w.join('carl');
+    await w.reload(rs[0]);
+    const all = [...rs, carl];
+    const [first, ...rest] = all;
+    expect(first.engine.frozen()?.reason).toBe('integrity');
+    for (const r of rest) {
+      expect(r.engine.frozen()).toEqual(first.engine.frozen());
+      expect(r.engine.adoptedChain()).toEqual(first.engine.adoptedChain());
+    }
+    await expect(carl.engine.renameCard(X, 'Carl edits')).rejects.toBeInstanceOf(FrozenError);
+    await expect(rs[0].engine.renameCard(X, 'Ana edits after reload')).rejects.toBeInstanceOf(FrozenError);
+    for (const r of all) {
+      w.collect(r);
+      w.check(r);
+    }
+    await settle(w);
+    return all;
+  }
+
+  it('a ceiling version the space does not hold is announced: a joiner and a reloaded replica freeze like the rest', async () => {
+    const { w, a, b, root, v1, v2 } = await twoVersions(352);
+    w.plant(v1.path, v1.bytes); // the space holds the lower version
+    await w.receiveNow(a, v1.path, v1.bytes);
+    await w.receiveNow(b, v2.path, v2.bytes); // Ben is served the ceiling version
+    await w.receiveNow(a, v2.path, v2.bytes); // Ana kept the lower one, so she announces
+    expect(a.journal).toHaveLength(1);
+    expect(decode(a.journal[0].bytes)).toMatchObject({
+      lamport: LAMPORT_LIMIT - 1, base: root, ops: [{ path: '_session/frozen', value: { reason: 'integrity', at: root } }],
+    });
+    await sendTo(w, a, b);
+    for (const r of await joinAndReload(w, [a, b])) expect(r.engine.frozen()).toEqual({ reason: 'integrity', at: root });
+  });
+
+  it('a space that holds the ceiling version: the replica that kept the lower one announces, and every reader agrees', async () => {
+    const { w, a, b, root, v1, v2 } = await twoVersions(353);
+    w.plant(v2.path, v2.bytes); // the space holds the ceiling version
+    await w.receiveNow(a, v1.path, v1.bytes); // Ana is served the lower one first
+    await w.receiveNow(a, v2.path);
+    await w.receiveNow(b, v2.path);
+    expect(a.journal.map((o) => decode(o.bytes).lamport)).toEqual([LAMPORT_LIMIT - 1]);
+    for (const r of await joinAndReload(w, [a, b])) expect(r.engine.frozen()).toEqual({ reason: 'integrity', at: root });
+  });
+
+  it('the announcement is written even when a stop freeze is already in force', async () => {
+    const { w, a, b, root, x1, v1, v2 } = await twoVersions(354);
+    const forger = 'mal.aaaaaaaa.dddddddd';
+    const rewrite: BatchBody = {
+      v: 1, actor: forger, seq: 1, lamport: 3, base: root, prev: '', time: '2026-10-06T00:00:00Z',
+      ops: [{ path: '_session/frozen', group: '$value', value: { reason: 'rewrite', at: x1 } }],
+    };
+    w.plant(batchPath(forger, 1), encodeBatch(rewrite));
+    for (const r of [a, b]) await w.receiveNow(r, batchPath(forger, 1));
+    expect(a.engine.frozen()).toEqual({ reason: 'rewrite', at: x1 });
+    w.plant(v1.path, v1.bytes);
+    await w.receiveNow(a, v1.path);
+    await w.receiveNow(b, v2.path, v2.bytes);
+    await w.receiveNow(a, v2.path, v2.bytes);
+    expect(a.engine.frozen()).toEqual({ reason: 'integrity', at: root });
+    w.collect(a);
+    for (const r of await joinAndReload(w, [a, b])) expect(r.engine.frozen()).toEqual({ reason: 'integrity', at: root });
+  });
+
+  it('a stop computed on a refused ancestry question is asked again by a poll of the same head', async () => {
+    const w = new World(355);
+    const a = await w.join('ana');
+    const root = w.git.main;
+    const x1 = outsideEdit(w, `cards/${X}.json`, { title: 'x1' });
+    const x2 = outsideEdit(w, `cards/${X}.json`, { title: 'x2' });
+    await w.sync(a);
+    expect(a.engine.adoptedChain()).toEqual([root, x1, x2]);
+    // A freeze at a side commit off x2: off the chain, so the stop needs the ancestry search.
+    const side = w.git.commit([x2], new Map(w.git.tree(x2)), 'side');
+    const forger = 'mal.aaaaaaaa.eeeeeeee';
+    const body: BatchBody = {
+      v: 1, actor: forger, seq: 1, lamport: 3, base: root, prev: '', time: '2026-10-06T00:00:00Z',
+      ops: [{ path: '_session/frozen', group: '$value', value: { reason: 'rewrite', at: side } }],
+    };
+    w.plant(batchPath(forger, 1), encodeBatch(body));
+    w.git.refuseNext = 1000; // the history verb is down for the whole of this input
+    await w.receiveNow(a, batchPath(forger, 1));
+    expect(a.engine.adoptedChain()).toEqual([root]); // the refusal counted as "not an ancestor"
+    w.git.refuseNext = 0;
+    await w.sync(a); // the same head: nothing to walk, but the stop is asked again
+    expect(a.engine.adoptedChain()).toEqual([root, x1, x2]);
+    w.check(a);
+    const calls = w.git.logCalls;
+    await w.sync(a);
+    expect(w.git.logCalls).toBe(calls);
     w.check(a);
   });
 
