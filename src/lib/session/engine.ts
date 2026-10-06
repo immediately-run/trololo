@@ -216,7 +216,7 @@ export class SessionEngine {
       const fresh: LogEntry[] = [];
       let k = -1;
       let cursor: string | null = head;
-      walk: while (cursor !== null) {
+      walk: while (cursor !== null && fresh.length < MAX_WALK) {
         const page = await history.log(cursor, 100);
         if (page.length === 0) break;
         for (const e of page) {
