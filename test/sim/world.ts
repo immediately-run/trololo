@@ -100,6 +100,7 @@ export class World {
   conflicts = 0;
   merges = 0;
   reloads = 0;
+  rewrites = 0;
 
   constructor(seed: number, tree: Tree = startTree()) {
     this.rng = seeded(seed);
@@ -135,6 +136,7 @@ export class World {
       layout: LAYOUT,
       start: this.commitOf(this.root),
       actor,
+      history: this.git,
       hash,
       clock: () => new Date((this.time += 1000)),
       random: (n) => this.int(n),
@@ -145,7 +147,7 @@ export class World {
       this.see(r, path, bytes, true);
     }
     await engine.markLogRead();
-    await engine.sync(this.git);
+    await engine.sync();
     r.syncedHead = this.git.main;
     this.collect(r);
     this.replicas.push(r);
@@ -207,6 +209,12 @@ export class World {
     r.unresolved = [];
   }
 
+  /** A batch file written to the space by someone outside the simulation (a forger): every replica will read it. */
+  plant(path: string, bytes: Uint8Array): void {
+    this.space.set(path, bytes);
+    for (const r of this.replicas) r.inbox.push(path);
+  }
+
   /** Delivers one batch file from the space to `r` now (out of band of its inbox). */
   async receiveNow(r: Replica, path: string, bytes = this.space.get(path)!): Promise<void> {
     r.inbox = r.inbox.filter((p) => p !== path);
@@ -230,7 +238,7 @@ export class World {
 
   async sync(r: Replica): Promise<void> {
     if (!r.online) return;
-    await r.engine.sync(this.git);
+    await r.engine.sync();
     r.syncedHead = this.git.main;
     this.collect(r);
   }
@@ -242,12 +250,20 @@ export class World {
     return out.reverse();
   }
 
+  /** The first-parent chain of `head` from the session's start base, or just the start base when it is not on it. */
+  chainFromStart(head: string): ChainCommit[] {
+    const chain = this.firstParentChain(head);
+    const i = chain.findIndex((c) => c.sha === this.root);
+    return i < 0 ? [this.commitOf(this.root)] : chain.slice(i);
+  }
+
   /** The oracle's view of one replica. */
   oracleOf(r: Replica): OracleResult {
     return oracle({
       layout: LAYOUT,
       sessionId: SESSION_ID,
-      offered: this.firstParentChain(r.syncedHead),
+      offered: this.chainFromStart(r.syncedHead),
+      isAncestor: (a, d) => this.git.reaches(a, d),
       batches: [...r.seen].map(([path, bytes]) => ({ path, bytes, acked: r.acked.has(path) })),
     });
   }
@@ -290,7 +306,7 @@ export class World {
     const o = this.oracleOf(r);
     const e = r.engine;
     const where = `replica ${r.name}`;
-    assert.deepEqual(e.offeredChain().map((c) => c.sha), this.firstParentChain(r.syncedHead).map((c) => c.sha), `${where}: offered chain`);
+    assert.deepEqual(e.offeredChain().map((c) => c.sha), o.offered, `${where}: offered chain`);
     assert.deepEqual(e.adoptedChain(), o.adopted, `${where}: adopted chain`);
     assert.deepEqual(e.frozen(), o.frozen, `${where}: frozen`);
     assert.deepEqual(vec(e.holdingVector()), vec(o.holding), `${where}: holding vector`);
@@ -499,12 +515,15 @@ export class World {
   /**
    * A rewrite of the main line: either a force-push (`main` drops its newest commit and gains
    * another) or a merge whose FIRST parent is another line, so the old head is reachable only
-   * through the second parent and leaves the first-parent chain (§5.3).
+   * through the second parent and leaves the first-parent chain (§5.3). A later rewrite sometimes
+   * drops two commits, so that it can remove the commit an earlier rewrite froze at (§15.5 the stop).
    */
   forcePush(): void {
     const head = this.git.commits.get(this.git.main)!;
     if (head.parents.length === 0) return;
-    const base = head.parents[0];
+    let base = head.parents[0];
+    const deeper = this.rewrites++ > 0 && this.rng() < 0.5 ? this.git.commits.get(base)!.parents[0] : undefined;
+    if (deeper !== undefined) base = deeper;
     const tree = new Map(this.git.tree(base));
     tree.set('README.md', `# Rewritten ${this.int(99)}\n`);
     const other = this.git.commit([base], tree, 'Rewritten history');

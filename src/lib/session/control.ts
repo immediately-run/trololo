@@ -1,5 +1,6 @@
 // The built-in control record set `_session/` (COLLABORATION_SESSIONS §15.5): terms and the
-// frozen state. Outside `Snap`, `C_B`, publish and §5.5; plain §3.8 last-write-wins.
+// frozen state. Outside `Snap`, `C_B`, publish and §5.5; §3.8 last-write-wins, with the freeze
+// precedence rule and the freeze an exhausted log implies (§15.5).
 
 import { compareOrder, CONTROL_GROUP, type Op, type OpRef } from './batch';
 import type { Json } from './canonical';
@@ -22,21 +23,45 @@ export interface ControlOp extends OpRef {
 
 export class ControlState {
   private readonly winners = new Map<string, ControlOp>();
+  /** The winning freeze implied by an exhausted log (§15.5), kept apart from the written ones. */
+  private implied: ControlOp | null = null;
 
   apply(op: ControlOp): void {
     const cur = this.winners.get(op.path);
     if (!cur || outranks(op, cur)) this.winners.set(op.path, op);
   }
 
+  /**
+   * A batch at the lamport ceiling has been read (§15.5, an exhausted log): it counts as carrying,
+   * after its own operations, an `integrity` freeze at its base. `ref` is the batch's own order key
+   * with `index` one past its last operation.
+   */
+  applyExhausted(ref: OpRef, at: string): void {
+    const op: ControlOp = { ...ref, path: FROZEN_PATH, value: { reason: 'integrity', at } };
+    if (!this.implied || outranks(op, this.implied)) this.implied = op;
+  }
+
+  /** The winning freeze, written or implied, under the §15.5 precedence rule. */
   frozen(): Frozen | null {
-    const v = this.winners.get(FROZEN_PATH)?.value as { reason: FreezeReason; at: string } | undefined;
-    return v ? { reason: v.reason, at: v.at } : null;
+    const written = this.winners.get(FROZEN_PATH);
+    const win = !written ? this.implied : !this.implied ? written : outranks(this.implied, written) ? this.implied : written;
+    return asFrozen(win);
+  }
+
+  /** The winning freeze written to the log, ignoring one an exhausted log implies. */
+  writtenFrozen(): Frozen | null {
+    return asFrozen(this.winners.get(FROZEN_PATH));
   }
 
   termsName(): string | null {
     const v = this.winners.get(TERMS_PATH)?.value as { name: string } | undefined;
     return v?.name ?? null;
   }
+}
+
+function asFrozen(op: ControlOp | null | undefined): Frozen | null {
+  const v = op?.value as { reason: FreezeReason; at: string } | undefined;
+  return v ? { reason: v.reason, at: v.at } : null;
 }
 
 /**

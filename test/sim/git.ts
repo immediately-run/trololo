@@ -16,6 +16,8 @@ export type PublishResult = { ok: true; sha: string } | { ok: false; code: 'conf
 export class SimGit implements HistoryPort {
   readonly commits = new Map<string, SimCommit>();
   main: string;
+  /** How many `log` pages have been read — lets a test see whether a poll walked history. */
+  logCalls = 0;
   private counter = 0;
 
   constructor(tree: Tree, message = 'Initial board') {
@@ -77,6 +79,7 @@ export class SimGit implements HistoryPort {
   }
 
   async log(from: string, limit: number): Promise<LogEntry[]> {
+    this.logCalls++;
     const out: LogEntry[] = [];
     let cur: string | null = from;
     while (cur !== null && out.length < limit) {
@@ -89,6 +92,11 @@ export class SimGit implements HistoryPort {
   }
 
   async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    return this.reaches(ancestor, descendant);
+  }
+
+  /** Reflexive reachability over every parent, synchronously (the oracle's view of ancestry). */
+  reaches(ancestor: string, descendant: string): boolean {
     const seen = new Set<string>();
     const stack = [descendant];
     while (stack.length) {

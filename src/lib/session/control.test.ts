@@ -38,4 +38,19 @@ describe('§15.5 control records', () => {
     expect(new Set(results.map((r) => JSON.stringify(r))).size).toBe(1);
     expect(results[0]).toEqual({ reason: 'rewrite', at: AT1 });
   });
+
+  it('an exhausted log implies an integrity freeze that a layout freeze cannot lift, written or not (§15.5)', () => {
+    const top = { lamport: 2 ** 48 - 1, actor: 'm.aaaaaaaa.aaaaaaaa', seq: 1, index: 1 };
+    const c = new ControlState();
+    c.apply(op(9, FROZEN_PATH, { reason: 'layout', at: AT2 }));
+    c.applyExhausted(top, AT1);
+    expect(c.frozen()).toEqual({ reason: 'integrity', at: AT1 });
+    expect(c.writtenFrozen()).toEqual({ reason: 'layout', at: AT2 });
+    // Among freezes that stop the chain, §3.8 order decides: the implied one sits at the ceiling.
+    c.apply(op(5, FROZEN_PATH, { reason: 'rewrite', at: AT2 }));
+    expect(c.frozen()).toEqual({ reason: 'integrity', at: AT1 });
+    c.apply({ ...op(2 ** 48 - 1, FROZEN_PATH, { reason: 'rewrite', at: AT2 }), actor: 'z.aaaaaaaa.aaaaaaaa' });
+    expect(c.frozen()).toEqual({ reason: 'rewrite', at: AT2 });
+    expect(new ControlState().frozen()).toBeNull();
+  });
 });

@@ -45,6 +45,8 @@ export interface EngineOptions {
   readonly start: ChainCommit;
   /** `<login>.<device>.<tab>` (§15.5). */
   readonly actor: string;
+  /** The bundle's history verbs (§16): `sync` reads the main line, and the freeze stop (§15.5) asks `isAncestor`. */
+  readonly history: HistoryPort;
   readonly hash: Hash;
   readonly clock: Clock;
   readonly random: RandomInt;
@@ -83,6 +85,12 @@ export interface PublishPlan {
 
 export class FrozenError extends Error {}
 export class NotReadyError extends Error {}
+/** A batch at the §3.8 lamport ceiling has been read, so no further batch can be issued (§15.5, an exhausted log). */
+export class LamportExhausted extends Error {
+  constructor() {
+    super('the lamport space is exhausted; restart the session');
+  }
+}
 /** A move would need a key longer than the budget (§3.4): propose `rebalance`, never do it silently. */
 export class RebalanceNeeded extends Error {
   readonly column: string | null;
@@ -100,6 +108,7 @@ export class SessionEngine {
   readonly sessionId: string;
   readonly layout: Layout;
   readonly actor: string;
+  private readonly history: HistoryPort;
   private readonly hash: Hash;
   private readonly clock: Clock;
   private readonly random: RandomInt;
@@ -110,7 +119,16 @@ export class SessionEngine {
   private readonly reasons = new Map<string, string>();
   private readonly control = new ControlState();
   private readonly fold: Fold;
+  /** The main line's first-parent chain from the start base, as of the last sync — never cut by a stop. */
   private offered: ChainCommit[];
+  /** The head `offered` was walked from; polling the same head again walks nothing (§15.5 stop, unreachable heads). */
+  private walkedHead: string | null = null;
+  /**
+   * Index on `offered` past which a rewrite or integrity freeze stops adoption (§15.5 the stop),
+   * cached under the winning freeze's `at` and the chain's tip.
+   */
+  private stopKey = '';
+  private stopIndex = Infinity;
   private lamportMax = -1;
   private ownSeq = 0;
   private ownPrev = '';
@@ -125,6 +143,7 @@ export class SessionEngine {
     this.sessionId = o.sessionId;
     this.layout = o.layout;
     this.actor = o.actor;
+    this.history = o.history;
     this.hash = o.hash;
     this.clock = o.clock;
     this.random = o.random;
@@ -172,25 +191,28 @@ export class SessionEngine {
   offer(commit: ChainCommit): Promise<void> {
     return this.exclusive(async () => {
       this.pushOffered(commit);
+      this.walkedHead = null;
       await this.settle();
     });
   }
 
   /** Reads the main line through the history verbs and offers every new first-parent commit. */
-  sync(history: HistoryPort): Promise<void> {
+  sync(): Promise<void> {
     return this.exclusive(async () => {
       if (!this.logRead) return; // a freeze may be needed, and nothing can be written yet
+      const history = this.history;
       const head = await history.head();
-      if (head === this.offered[this.offered.length - 1].sha) return;
+      if (head === this.walkedHead || head === this.offered[this.offered.length - 1].sha) return;
       // Walk the head's first-parent chain (§5.3) back to a commit we were already offered.
       const known = new Map(this.offered.map((c, i) => [c.sha, i]));
       const fresh: LogEntry[] = [];
       let k = -1;
       let cursor: string | null = head;
-      walk: while (cursor !== null && fresh.length < MAX_WALK) {
+      walk: while (cursor !== null) {
         const page = await history.log(cursor, 100);
         if (page.length === 0) break;
         for (const e of page) {
+          if (fresh.length >= MAX_WALK) break walk;
           const i = known.get(e.sha);
           if (i !== undefined) {
             k = i;
@@ -205,25 +227,24 @@ export class SessionEngine {
         // §15.7: the head no longer has our adopted base on its first-parent chain — a rewrite
         // (a force-push, or a merge whose first parent skips it). Freeze at the last adopted base
         // still on the chain (unless a stop is already in force) and, in every case, drop what the
-        // rewrite removed: back to that base, then follow the new chain up to the freeze point.
+        // rewrite removed. Where the chain then stops is the §15.5 stop, computed in `settle`.
         const m = Math.max(k, 0);
         await this.freeze('rewrite', this.fold.chain[m].sha);
         this.rollbackTo(m);
-        if (k < 0) {
-          // Not even the start base is on the chain within reach: nothing new can follow it.
-          this.offered = this.offered.slice(0, 1);
-          await this.settle();
-          return;
+      }
+      if (k < 0) {
+        // Not even the start base is on the chain within reach: nothing new can follow it.
+        this.offered = this.offered.slice(0, 1);
+      } else {
+        this.offered = this.offered.slice(0, k + 1); // forget unadopted commits a rewrite removed
+        for (const e of fresh.reverse()) {
+          this.pushOffered({ sha: e.sha, parent: e.parent, message: e.message, tree: await history.read(e.sha) });
         }
       }
-      this.offered = this.offered.slice(0, k + 1); // forget unadopted commits the rewrite removed
-      for (const e of fresh.reverse()) {
-        this.pushOffered({ sha: e.sha, parent: e.parent, message: e.message, tree: await history.read(e.sha) });
-      }
+      this.walkedHead = head;
       await this.settle();
     });
   }
-
 
   // ---- outputs -----------------------------------------------------------------------------
 
@@ -243,9 +264,9 @@ export class SessionEngine {
     return this.fold.chain.map((e) => e.sha);
   }
 
-  /** Commits offered so far (adopted or queued), start base first. */
+  /** Commits offered so far (adopted or queued), start base first; none past a freeze's stop (§15.5). */
   offeredChain(): readonly ChainCommit[] {
-    return this.offered;
+    return this.offered.slice(0, Math.min(this.offered.length, this.stopIndex + 1));
   }
 
   frozen(): Frozen | null {
@@ -340,9 +361,20 @@ export class SessionEngine {
     return out.sort((a, b) => cmp(a.id, b.id));
   }
 
-  /** What "Restart session" offers for re-application (§3.1, §15.7). */
+  /**
+   * What "Restart session" offers for re-application (§3.1, §15.7): the effective-pending
+   * operations, and for a record that exists only through a pending create, every group of that
+   * create — a satisfied default included — so that re-applying it is again a valid create batch.
+   */
   restartOffer(): PendingOp[] {
-    return this.pending();
+    const out = new Map(this.pending().map((p) => [p.id, p]));
+    for (const rec of this.fold.effective().values()) {
+      if (!rec.exists || rec.base !== null) continue;
+      for (const op of rec.from.values()) {
+        out.set(op.id, { id: op.id, actor: op.actor, path: op.path, group: op.group, value: op.value });
+      }
+    }
+    return [...out.values()].sort((a, b) => cmp(a.path, b.path) || cmp(a.group, b.group));
   }
 
   /** The publish of this replica's publish vector on its adopted base (§6.2), or null when frozen by a rewrite or an integrity failure. */
@@ -533,7 +565,13 @@ export class SessionEngine {
     if (!seqs) this.slots.set(r.actor, (seqs = new Map()));
     seqs.set(r.seq, r);
     if (acked) this.acked.add(r.key);
-    if (r.body) this.lamportMax = Math.max(this.lamportMax, r.body.lamport);
+    if (r.body) {
+      this.lamportMax = Math.max(this.lamportMax, r.body.lamport);
+      // §15.5, an exhausted log: nobody can write after this batch, so it implies the freeze itself.
+      if (r.body.lamport === LAMPORT_LIMIT - 1) {
+        this.control.applyExhausted({ lamport: r.body.lamport, actor: r.actor, seq: r.seq, index: r.body.ops.length }, r.body.base);
+      }
+    }
     if (!r.body) {
       this.states.set(r.key, 'invalid');
       this.reasons.set(r.key, r.shapeError ?? 'invalid');
@@ -553,12 +591,40 @@ export class SessionEngine {
     return undefined;
   }
 
-  /** Index on the offered chain past which a rewrite or integrity freeze stops adoption. */
-  private cap(): number {
+  /**
+   * Recomputes the §15.5 stop when the winning freeze or the chain has changed, and rolls the adopted
+   * chain back past it. True when it rolled back.
+   */
+  private async restop(): Promise<boolean> {
     const f = this.frozen();
-    if (!stopsChain(f)) return Infinity;
-    const i = this.offered.findIndex((c) => c.sha === f!.at);
-    return i < 0 ? Infinity : i;
+    const key = stopsChain(f) ? `${f!.at} ${this.offered[this.offered.length - 1].sha}` : '';
+    if (key !== this.stopKey) {
+      this.stopIndex = key === '' ? Infinity : await this.stopOn(f!.at);
+      this.stopKey = key;
+    }
+    if (this.stopIndex >= this.fold.chain.length - 1) return false;
+    this.rollbackTo(this.stopIndex);
+    return true;
+  }
+
+  /**
+   * §15.5 the stop: the last commit of the offered chain that is an ancestor of `at`, or the start
+   * base when none is. Ancestry is closed under first parents, so the ancestors form a prefix of the
+   * chain and a binary search over `isAncestor` finds its end.
+   */
+  private async stopOn(at: string): Promise<number> {
+    const chain = this.offered;
+    const exact = chain.findIndex((c) => c.sha === at);
+    if (exact >= 0) return exact;
+    if (!(await this.history.isAncestor(chain[0].sha, at))) return 0;
+    let lo = 0;
+    let hi = chain.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (await this.history.isAncestor(chain[mid].sha, at)) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
   }
 
   private tryApply(r: Received): boolean {
@@ -608,8 +674,6 @@ export class SessionEngine {
       if (!op.path.startsWith(CONTROL_PREFIX)) return;
       this.control.apply({ actor: body.actor, seq: body.seq, lamport: body.lamport, index, path: op.path, value: op.value });
     });
-    const cap = this.cap();
-    if (cap < this.fold.chain.length - 1) this.rollbackTo(cap);
   }
 
   /** Rolls the adopted chain back to `index`; content batches based later are held again (§5.4 d). */
@@ -634,13 +698,16 @@ export class SessionEngine {
           if (this.states.get(r.key) === 'held' && this.tryApply(r)) progress = true;
         }
       }
+      // A freeze applied above, or written while adopting below, moves the stop before anything else is adopted.
+      if (await this.restop()) progress = true;
       if (await this.adoptNext()) progress = true;
+      if (await this.restop()) progress = true;
     }
   }
 
   private async adoptNext(): Promise<boolean> {
     const next = this.offered[this.fold.chain.length];
-    if (!next || this.fold.chain.length - 1 >= this.cap()) return false;
+    if (!next || this.fold.chain.length - 1 >= this.stopIndex) return false;
     const reading = readTrailers(next.message, this.sessionId);
     if (reading.kind === 'malformed') {
       await this.freeze('integrity', this.fold.head.sha);
@@ -665,15 +732,22 @@ export class SessionEngine {
 
   /** Writes `_session/frozen` once (§15.7); every replica freezes when it arrives. */
   private async freeze(reason: FreezeReason, at: string): Promise<void> {
-    const f = this.frozen();
-    // Idempotent (§15.5): once per replica, unless a layout freeze is overtaken by one that stops the chain.
+    // Idempotent (§15.5): once per replica, unless a layout freeze is overtaken by one that stops the
+    // chain. What counts is the log's own freezes: one an exhausted log implies needs no writing.
+    const f = this.control.writtenFrozen();
     if (!this.logRead) {
       this.deferredFreezes.push({ reason, at });
       return;
     }
     if (this.freezeIssued.has(reason) || stopsChain(f) || (f !== null && reason === 'layout')) return;
+    try {
+      await this.issueUnlocked([frozenOp(reason, at)]);
+    } catch (err) {
+      // An exhausted log already freezes every reader with reason `integrity` (§15.5): nothing to add.
+      if (err instanceof LamportExhausted) return;
+      throw err;
+    }
     this.freezeIssued.add(reason);
-    await this.issueUnlocked([frozenOp(reason, at)]);
   }
 
   private async issueUnlocked(ops: readonly Op[]): Promise<OutgoingBatch> {
@@ -681,7 +755,7 @@ export class SessionEngine {
     const content = ops.some((op) => !op.path.startsWith(CONTROL_PREFIX));
     if (content && this.frozen() !== null) throw new FrozenError(`the session is frozen (${this.frozen()!.reason})`);
     const seq = this.ownSeq + 1;
-    if (this.lamportMax + 1 >= LAMPORT_LIMIT) throw new Error('the lamport space is exhausted; restart the session');
+    if (this.lamportMax + 1 >= LAMPORT_LIMIT) throw new LamportExhausted();
     const body: BatchBody = {
       v: BATCH_VERSION,
       actor: this.actor,

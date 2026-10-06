@@ -30,6 +30,8 @@ interface Coverage {
   supersededRuns: number;
   unfrozenRuns: number;
   frozenRuns: number;
+  twoFreezeRuns: number;
+  twoRewriteRuns: number;
 }
 
 async function run(seed: number, replicas: number, actions: number[], cov?: Coverage): Promise<World> {
@@ -38,9 +40,9 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
   const rs: Replica[] = [];
   for (let i = 0; i < replicas; i++) rs.push(await w.join(logins[i]));
 
-  // A layout change or a rewrite freezes the session for good; keep at most one per run, in the
-  // last third, so most of a run exercises a live session.
-  let freezer = false;
+  // A layout change or a rewrite freezes the session for good; keep at most two per run, in the
+  // last third, so most of a run exercises a live session and some runs rewrite twice (§15.5 the stop).
+  let freezers = 0;
   for (const [i, a] of actions.entries()) {
     const r = rs[w.int(rs.length)];
     const late = i >= (actions.length * 2) / 3;
@@ -61,8 +63,8 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
     else if (a < 91) r.online = !r.online;
     else if (a === 91) await w.reload(r);
     else if (a === 92 || a === 93) {
-      if (late && !freezer) {
-        freezer = true;
+      if (late && freezers < 2) {
+        freezers++;
         if (a === 92) w.layoutChange();
         else w.forcePush();
       } else await w.deliver(r, Infinity);
@@ -80,6 +82,8 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
     if (rs.some((r) => r.engine.superseded().length > 0)) cov.supersededRuns++;
     if (rs[0].engine.frozen() === null) cov.unfrozenRuns++;
     else cov.frozenRuns++;
+    if (freezers === 2) cov.twoFreezeRuns++;
+    if (w.rewrites === 2) cov.twoRewriteRuns++;
   }
   return w;
 }
@@ -90,7 +94,7 @@ describe('convergence', () => {
   });
 
   it(`random sessions converge to the oracle (${RUNS} runs)`, async () => {
-    const cov: Coverage = { publishes: 0, conflicts: 0, merges: 0, reloads: 0, supersededRuns: 0, unfrozenRuns: 0, frozenRuns: 0 };
+    const cov: Coverage = { publishes: 0, conflicts: 0, merges: 0, reloads: 0, supersededRuns: 0, unfrozenRuns: 0, frozenRuns: 0, twoFreezeRuns: 0, twoRewriteRuns: 0 };
     await fc.assert(
       fc.asyncProperty(
         fc.integer({ min: 1, max: 2 ** 31 - 1 }),
@@ -112,6 +116,8 @@ describe('convergence', () => {
     expect(cov.supersededRuns).toBeGreaterThan(RUNS / 10);
     expect(cov.unfrozenRuns).toBeGreaterThan(RUNS / 2);
     expect(cov.frozenRuns).toBeGreaterThan(RUNS / 50);
+    expect(cov.twoFreezeRuns).toBeGreaterThan(RUNS / 200);
+    expect(cov.twoRewriteRuns).toBeGreaterThan(0);
     console.info('convergence coverage', cov);
   });
 });

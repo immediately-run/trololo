@@ -40,8 +40,13 @@ export interface OracleCommit {
 export interface OracleInput {
   readonly layout: Layout;
   readonly sessionId: string;
-  /** The commits offered to the replica, start base first, in first-parent order. */
+  /**
+   * The main line's first-parent chain from the session's start base, as the replica last read it
+   * (just the start base when the head's chain does not reach it).
+   */
   readonly offered: readonly OracleCommit[];
+  /** Git ancestry, reflexive (the simulated history; §15.5 the stop). */
+  readonly isAncestor: (ancestor: string, descendant: string) => boolean;
   /** The batch files the replica holds, with whether each is log-acknowledged. */
   readonly batches: ReadonlyArray<{ path: string; bytes: Uint8Array; acked: boolean }>;
 }
@@ -54,6 +59,8 @@ export interface OracleRecord {
 }
 
 export interface OracleResult {
+  /** The chain the replica may adopt from: `offered`, cut at a freeze's stop (§15.5). */
+  readonly offered: string[];
   readonly adopted: string[];
   readonly states: Map<string, 'held' | 'invalid' | 'applied'>;
   readonly statuses: Map<string, OracleStatus>;
@@ -347,45 +354,56 @@ export function oracle(input: OracleInput): OracleResult {
   };
   const holding = contiguousBy(() => true);
 
-  // Frozen: the §3.8 winner among the frozen operations of control-only batches.
-  let frozenWin: { lamport: number; actor: string; seq: number; index: number; value: { reason: string; at: string } } | null = null;
+  // Frozen (§15.5): every `_session/frozen` operation of a control-only batch, plus the freeze an
+  // exhausted log implies — a batch at lamport 2^48 − 1 counts as carrying `{integrity, its base}`
+  // after its own operations. The winner: a freeze that stops the chain outranks a layout freeze;
+  // then §3.8 order.
+  type FreezeCand = { lamport: number; actor: string; seq: number; index: number; value: { reason: string; at: string } };
+  const cands: FreezeCand[] = [];
   for (const b of slots.values()) {
-    if (!b.body || !b.controlOnly) continue;
-    b.body.ops.forEach((op, index) => {
-      if (op.path !== '_session/frozen') return;
-      const cand = { lamport: b.body!.lamport, actor: b.actor, seq: b.seq, index, value: op.value as { reason: string; at: string } };
-      // §15.5 as amended: a freeze that stops the chain outranks a layout freeze; then §3.8 order.
-      const stopsA = cand.value.reason !== 'layout';
-      const stopsB = frozenWin !== null && (frozenWin as { value: { reason: string } }).value.reason !== 'layout';
-      const wins =
-        !frozenWin ||
-        (stopsA && !stopsB) ||
-        (stopsA === stopsB && (
-        cand.lamport > frozenWin.lamport ||
-        (cand.lamport === frozenWin.lamport &&
-          (lt(frozenWin.actor, cand.actor) ||
-            (cand.actor === frozenWin.actor && (cand.seq > frozenWin.seq || (cand.seq === frozenWin.seq && cand.index > frozenWin.index)))))));
-      if (wins) frozenWin = cand;
-    });
+    if (!b.body) continue;
+    const at = { lamport: b.body.lamport, actor: b.actor, seq: b.seq };
+    if (b.controlOnly) {
+      b.body.ops.forEach((op, index) => {
+        if (op.path === '_session/frozen') cands.push({ ...at, index, value: op.value as FreezeCand['value'] });
+      });
+    }
+    if (b.body.lamport === 2 ** 48 - 1) cands.push({ ...at, index: b.body.ops.length, value: { reason: 'integrity', at: b.body.base } });
   }
-  const frozen = frozenWin ? { reason: (frozenWin as { value: { reason: string; at: string } }).value.reason, at: (frozenWin as { value: { reason: string; at: string } }).value.at } : null;
+  const beats = (x: FreezeCand, y: FreezeCand): boolean => {
+    const sx = x.value.reason !== 'layout';
+    const sy = y.value.reason !== 'layout';
+    if (sx !== sy) return sx;
+    if (x.lamport !== y.lamport) return x.lamport > y.lamport;
+    if (x.actor !== y.actor) return lt(y.actor, x.actor);
+    if (x.seq !== y.seq) return x.seq > y.seq;
+    return x.index > y.index;
+  };
+  let frozenWin: FreezeCand | null = null;
+  for (const c of cands) if (frozenWin === null || beats(c, frozenWin)) frozenWin = c;
+  const frozen = frozenWin ? { reason: frozenWin.value.reason, at: frozenWin.value.at } : null;
   const stops = frozen !== null && frozen.reason !== 'layout';
 
-  // §5.4 (a), (c): adopt offered commits in order while the holding vector dominates each `V_B`.
-  const chain: Array<{ commit: OracleCommit; V: Map<string, number> }> = [{ commit: offered[0], V: new Map() }];
-  for (let i = 1; i < offered.length; i++) {
-    if (stops && chain[chain.length - 1].commit.sha === frozen!.at) break;
-    const r = readCommit(offered[i].message, sessionId);
+  // §15.5 the stop: under a freeze that stops the chain, the chain ends at its last commit that is an
+  // ancestor of the freeze's `at` (the start base when none is), whatever the replica had adopted.
+  let reachable = offered;
+  if (stops) {
+    let j = 0;
+    offered.forEach((c, i) => {
+      if (input.isAncestor(c.sha, frozen!.at)) j = i;
+    });
+    reachable = offered.slice(0, j + 1);
+  }
+
+  // §5.4 (a), (c): adopt the chain's commits in order while the holding vector dominates each `V_B`.
+  const chain: Array<{ commit: OracleCommit; V: Map<string, number> }> = [{ commit: reachable[0], V: new Map() }];
+  for (let i = 1; i < reachable.length; i++) {
+    const r = readCommit(reachable[i].message, sessionId);
     if (r.kind === 'bad') break;
     const V = r.kind === 'publish' ? r.v : new Map<string, number>();
     if ([...V].some(([a, s]) => (holding.get(a) ?? 0) < s)) break;
     if (r.kind === 'publish' && digestFor(V, slots) !== r.digest) break;
-    chain.push({ commit: offered[i], V });
-  }
-  // A freeze that stops the chain at an adopted commit cuts it there.
-  if (stops) {
-    const k = chain.findIndex((c) => c.commit.sha === frozen!.at);
-    if (k >= 0) chain.length = k + 1;
+    chain.push({ commit: reachable[i], V });
   }
   const n = chain.length - 1;
   const indexOf = new Map(chain.map((c, i) => [c.commit.sha, i]));
@@ -517,6 +535,7 @@ export function oracle(input: OracleInput): OracleResult {
 
   return {
     rendered: render(eff),
+    offered: reachable.map((c) => c.sha),
     adopted: chain.map((c) => c.commit.sha),
     states,
     statuses: new Map(ops.map((op) => [op.id, statusOf(op)])),
