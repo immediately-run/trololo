@@ -290,7 +290,12 @@ export class World {
     const o = this.oracleOf(r);
     const e = r.engine;
     const where = `replica ${r.name}`;
-    assert.deepEqual(e.offeredChain().map((c) => c.sha), this.firstParentChain(r.syncedHead).map((c) => c.sha), `${where}: offered chain`);
+    // Once a freeze that stops the chain is in force, the engine offers nothing past its `at`
+    // (and, if `at` left the chain, nothing past where it stood — not derivable here, so skipped).
+    let expected = this.firstParentChain(r.syncedHead).map((c) => c.sha);
+    const stop = o.frozen && o.frozen.reason !== 'layout' ? expected.indexOf(o.frozen.at) : -2;
+    if (stop >= 0) expected = expected.slice(0, stop + 1);
+    if (stop !== -1) assert.deepEqual(e.offeredChain().map((c) => c.sha), expected, `${where}: offered chain`);
     assert.deepEqual(e.adoptedChain(), o.adopted, `${where}: adopted chain`);
     assert.deepEqual(e.frozen(), o.frozen, `${where}: frozen`);
     assert.deepEqual(vec(e.holdingVector()), vec(o.holding), `${where}: holding vector`);

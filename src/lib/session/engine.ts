@@ -117,6 +117,9 @@ export class SessionEngine {
   private logRead = false;
   private readonly freezeIssued = new Set<FreezeReason>();
   private deferredFreezes: Frozen[] = [];
+  private localFrozen: Frozen | null = null;
+  /** A head whose first-parent chain does not reach our start base (see `sync`). */
+  private unreachableHead: string | null = null;
   private outbox: OutgoingBatch[] = [];
   private readonly dismissed = new Set<string>();
   private lock: Promise<unknown> = Promise.resolve();
@@ -181,7 +184,7 @@ export class SessionEngine {
     return this.exclusive(async () => {
       if (!this.logRead) return; // a freeze may be needed, and nothing can be written yet
       const head = await history.head();
-      if (head === this.offered[this.offered.length - 1].sha) return;
+      if (head === this.offered[this.offered.length - 1].sha || head === this.unreachableHead) return;
       // Walk the head's first-parent chain (§5.3) back to a commit we were already offered.
       const known = new Map(this.offered.map((c, i) => [c.sha, i]));
       const fresh: LogEntry[] = [];
@@ -191,6 +194,7 @@ export class SessionEngine {
         const page = await history.log(cursor, 100);
         if (page.length === 0) break;
         for (const e of page) {
+          if (fresh.length >= MAX_WALK) break walk;
           const i = known.get(e.sha);
           if (i !== undefined) {
             k = i;
@@ -211,13 +215,26 @@ export class SessionEngine {
         this.rollbackTo(m);
         if (k < 0) {
           // Not even the start base is on the chain within reach: nothing new can follow it.
+          // Remember this head so later polls do not walk the whole history again.
           this.offered = this.offered.slice(0, 1);
+          this.unreachableHead = head;
           await this.settle();
           return;
         }
       }
-      this.offered = this.offered.slice(0, k + 1); // forget unadopted commits the rewrite removed
-      for (const e of fresh.reverse()) {
+      // Forget unadopted commits a rewrite removed, then follow the new chain — but once a freeze
+      // that stops the chain is in force, never past its `at`, and if `at` is no longer on the
+      // chain (a second rewrite removed it), no further than where this replica already is.
+      const next = [...this.offered.slice(0, k + 1).map((c) => ({ sha: c.sha, commit: c as ChainCommit | null, entry: null as LogEntry | null })), ...fresh.reverse().map((e) => ({ sha: e.sha, commit: null, entry: e }))];
+      const f = this.frozen();
+      let keep = next.length;
+      if (stopsChain(f)) {
+        const i = next.findIndex((c) => c.sha === f!.at);
+        keep = i >= 0 ? i + 1 : Math.min(next.length, this.fold.chain.length);
+      }
+      this.offered = this.offered.slice(0, Math.min(k + 1, keep));
+      for (const c of next.slice(this.offered.length, keep)) {
+        const e = c.entry!;
         this.pushOffered({ sha: e.sha, parent: e.parent, message: e.message, tree: await history.read(e.sha) });
       }
       await this.settle();
@@ -249,7 +266,8 @@ export class SessionEngine {
   }
 
   frozen(): Frozen | null {
-    return this.control.frozen();
+    // A freeze this replica could not write (no batch can be issued) still holds locally.
+    return this.control.frozen() ?? this.localFrozen;
   }
 
   termsName(): string | null {
@@ -340,9 +358,20 @@ export class SessionEngine {
     return out.sort((a, b) => cmp(a.id, b.id));
   }
 
-  /** What "Restart session" offers for re-application (§3.1, §15.7). */
+  /**
+   * What "Restart session" offers for re-application (§3.1, §15.7): the effective-pending
+   * operations, and for a record that exists only through a pending create, every group of that
+   * create — a satisfied default included — so that re-applying it is again a valid create batch.
+   */
   restartOffer(): PendingOp[] {
-    return this.pending();
+    const out = new Map(this.pending().map((p) => [p.id, p]));
+    for (const rec of this.fold.effective().values()) {
+      if (!rec.exists || rec.base !== null) continue;
+      for (const op of rec.from.values()) {
+        out.set(op.id, { id: op.id, actor: op.actor, path: op.path, group: op.group, value: op.value });
+      }
+    }
+    return [...out.values()].sort((a, b) => cmp(a.path, b.path) || cmp(a.group, b.group));
   }
 
   /** The publish of this replica's publish vector on its adopted base (§6.2), or null when frozen by a rewrite or an integrity failure. */
@@ -610,6 +639,7 @@ export class SessionEngine {
     });
     const cap = this.cap();
     if (cap < this.fold.chain.length - 1) this.rollbackTo(cap);
+    if (cap < this.offered.length - 1) this.offered = this.offered.slice(0, cap + 1); // nothing past `at`
   }
 
   /** Rolls the adopted chain back to `index`; content batches based later are held again (§5.4 d). */
@@ -672,8 +702,16 @@ export class SessionEngine {
       return;
     }
     if (this.freezeIssued.has(reason) || stopsChain(f) || (f !== null && reason === 'layout')) return;
-    this.freezeIssued.add(reason);
-    await this.issueUnlocked([frozenOp(reason, at)]);
+    try {
+      await this.issueUnlocked([frozenOp(reason, at)]);
+      this.freezeIssued.add(reason);
+    } catch {
+      // Nothing can be written (the lamport space is exhausted): freeze here regardless. Other
+      // replicas detect the same condition themselves, or read the same exhausted log.
+      if (!stopsChain(this.localFrozen)) this.localFrozen = { reason, at };
+      const cap = this.cap();
+      if (cap < this.fold.chain.length - 1) this.rollbackTo(cap);
+    }
   }
 
   private async issueUnlocked(ops: readonly Op[]): Promise<OutgoingBatch> {

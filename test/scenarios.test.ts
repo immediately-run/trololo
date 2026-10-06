@@ -207,7 +207,8 @@ describe('§15.9 scenarios', () => {
     await b.engine.renameCard(Y, 'Other activity meanwhile');
     await settle(w);
     expect(a.engine.pending().filter((p) => p.path === `cards/${X}.json`)).toEqual(before.pending);
-    expect(a.engine.statuses().get(`${JSON.parse(new TextDecoder().decode(op)).actor}/1/0`)).toEqual(before.statuses[0][1]);
+    const opId = `${JSON.parse(new TextDecoder().decode(op)).actor}/1/0`;
+    expect(a.engine.statuses().get(opId)).toEqual(new Map(before.statuses).get(opId));
     expect(await w.publish(a)).toBe('published'); // a later publish still lands it
     expect(JSON.parse(w.git.tree().get(`cards/${X}.json`)!).title).toBe('Kept pending');
     await settle(w);
