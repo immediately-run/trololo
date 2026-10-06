@@ -1,0 +1,41 @@
+{
+  "name": "trololo",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "immediately.run": {
+    "$schema": "https://immediately.run/immediately-run-config.schema.json"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint . --max-warnings 0",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@immediately-run/sdk": "0.72.0",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@immediately-run/dev-fs": "^0.1.0",
+    "@mdx-js/rollup": "^3.1.0",
+    "@types/node": "^24.12.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "eslint": "^9.39.4",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "fast-check": "^4.10.2",
+    "globals": "^17.5.0",
+    "typescript": "~6.0.2",
+    "typescript-eslint": "^8.58.2",
+    "vite": "^8.0.9",
+    "vitest": "^5.0.3"
+  },
+  "description": "A Trello-like board whose collaboration sessions are semantically correct — the COLLABORATION_SESSIONS proof of concept.",
+  "license": "MIT"
+}

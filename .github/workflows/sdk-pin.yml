@@ -1,0 +1,28 @@
+# R3-412 — the SDK pin must not drift behind npm. The platform resolves the
+# EXACT pin (a "^" range resolves to its floor, which once left the template
+# silently running a 41-minor-stale SDK), so staleness has to be caught here.
+#
+# Weekly: fetch the latest published @immediately-run/sdk from npm and fail with
+# instructions when the pin is behind. Bump the pin in the same PR as app
+# changes that need the new API (the release notes live at
+# https://immediately-run.github.io/immediately-run-sdk/).
+name: SDK pin freshness
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the pin with npm latest
+        run: |
+          PINNED=$(node -p "require('./package.json').dependencies['@immediately-run/sdk']")
+          LATEST=$(npm view @immediately-run/sdk version)
+          echo "pinned=$PINNED latest=$LATEST"
+          if [ "$PINNED" != "$LATEST" ]; then
+            echo "::error::The pinned SDK ($PINNED) is behind npm latest ($LATEST). Bump the EXACT pin in package.json (a ^ range resolves to its floor on the platform — never use a range)."
+            exit 1
+          fi
