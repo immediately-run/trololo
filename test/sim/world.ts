@@ -516,6 +516,15 @@ export class World {
    * the ceiling lamport — served out of band, since the create-only space keeps one version per path.
    */
   async plantSecondVersion(): Promise<void> {
+    // About a third of the time, build P2's shape outright: a stored ceiling batch, then a second
+    // ceiling version of it on another base (the branch below reaches it only when an earlier plant
+    // happened to store a ceiling batch).
+    if (this.rng() < 0.3) {
+      const chain = this.firstParentChain(this.git.main);
+      const stored = this.forgedBatch(LAMPORT_LIMIT - 1, this.pick(chain)!.sha, `Ceiling ${this.int(9)}`);
+      this.plant(stored.path, stored.bytes);
+      this.ceilingPlants++;
+    }
     const paths = [...this.space.keys()].filter((p) => p.startsWith('batches/'));
     const bodyOf = (p: string) => JSON.parse(new TextDecoder().decode(this.space.get(p)!)) as BatchBody;
     // Mostly, when the space stores a ceiling batch, a second version OF it (P2's shape:

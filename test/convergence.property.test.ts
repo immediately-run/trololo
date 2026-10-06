@@ -188,7 +188,7 @@ describe('convergence', () => {
     // A replica that read a ceiling version and a second version (the P1/P3 shapes), and one that
     // read two ceiling versions of one slot (P2).
     expect(cov.combinedRuns).toBeGreaterThan(RUNS / 250);
-    expect(cov.twoCeilingRuns).toBeGreaterThan(0);
+    expect(cov.twoCeilingRuns).toBeGreaterThan(RUNS / 250);
     // Round 1's shape: two replicas read the same versions but keep different ones of a slot.
     expect(cov.orderSplitRuns).toBeGreaterThan(RUNS / 250);
     // A replica that joins after a plant, reading the space only.
