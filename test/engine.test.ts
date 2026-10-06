@@ -411,6 +411,7 @@ describe('R3-998: control operations in a mixed batch are inert (§15.5)', () =>
     const sent = await a.engine.issue([
       { path: `cards/${X}.json`, group: 'title', value: 'Held again' },
       frozenOp('layout', w.git.main),
+      termsOp('Held terms'),
     ]);
     expect(a.engine.batchState(sent.path)).toBe('applied');
     expect(a.engine.frozen()).toBeNull();
@@ -418,8 +419,10 @@ describe('R3-998: control operations in a mixed batch are inert (§15.5)', () =>
     await settle(w);
     for (const r of [a, b]) {
       expect(r.engine.batchState(sent.path)).toBe('held');
-      // The rewrite's own freeze, identical everywhere — never the inert layout freeze.
+      // The rewrite's own freeze, identical everywhere. It would outrank a leftover layout freeze
+      // by precedence, so the terms op is what proves nothing of the batch's control state stayed.
       expect(r.engine.frozen()?.reason).toBe('rewrite');
+      expect(r.engine.termsName()).toBeNull();
     }
   });
   it('a mixed batch with a malformed control operation is invalid in its entirety, like any batch of the wrong shape', async () => {
