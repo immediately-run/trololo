@@ -77,6 +77,8 @@ export class Replica {
    * head it last synced.
    */
   seen = new Map<string, Uint8Array>();
+  /** Later versions of a path that differ from the first one read (an integrity failure), in reading order. */
+  laterVersions: Array<{ path: string; bytes: Uint8Array }> = [];
   acked = new Set<string>();
   syncedHead = '';
 
@@ -101,6 +103,8 @@ export class World {
   merges = 0;
   reloads = 0;
   rewrites = 0;
+  /** A check saw a replica whose winning stop freeze has its `at` off the chain (the stop's ancestry search). */
+  stopOffChain = false;
 
   constructor(seed: number, tree: Tree = startTree()) {
     this.rng = seeded(seed);
@@ -164,13 +168,18 @@ export class World {
     r.unresolved = [];
     r.inbox = [];
     r.seen = fresh.seen;
+    r.laterVersions = fresh.laterVersions;
     r.acked = fresh.acked;
     r.syncedHead = fresh.syncedHead;
     this.reloads++;
   }
 
   see(r: Replica, path: string, bytes: Uint8Array, acked: boolean): void {
-    if (!r.seen.has(path)) r.seen.set(path, bytes);
+    const first = r.seen.get(path);
+    if (!first) r.seen.set(path, bytes);
+    else if (!sameBytes(first, bytes) && !r.laterVersions.some((v) => v.path === path && sameBytes(v.bytes, bytes))) {
+      r.laterVersions.push({ path, bytes });
+    }
     if (acked) r.acked.add(path);
   }
 
@@ -264,7 +273,7 @@ export class World {
       sessionId: SESSION_ID,
       offered: this.chainFromStart(r.syncedHead),
       isAncestor: (a, d) => this.git.reaches(a, d),
-      batches: [...r.seen].map(([path, bytes]) => ({ path, bytes, acked: r.acked.has(path) })),
+      batches: [...r.seen, ...r.laterVersions.map((v) => [v.path, v.bytes] as const)].map(([path, bytes]) => ({ path, bytes, acked: r.acked.has(path) })),
     });
   }
 
@@ -306,6 +315,7 @@ export class World {
     const o = this.oracleOf(r);
     const e = r.engine;
     const where = `replica ${r.name}`;
+    if (o.frozen && o.frozen.reason !== 'layout' && !this.chainFromStart(r.syncedHead).some((c) => c.sha === o.frozen!.at)) this.stopOffChain = true;
     assert.deepEqual(e.offeredChain().map((c) => c.sha), o.offered, `${where}: offered chain`);
     assert.deepEqual(e.adoptedChain(), o.adopted, `${where}: adopted chain`);
     assert.deepEqual(e.frozen(), o.frozen, `${where}: frozen`);
@@ -515,15 +525,16 @@ export class World {
   /**
    * A rewrite of the main line: either a force-push (`main` drops its newest commit and gains
    * another) or a merge whose FIRST parent is another line, so the old head is reachable only
-   * through the second parent and leaves the first-parent chain (§5.3). A later rewrite sometimes
-   * drops two commits, so that it can remove the commit an earlier rewrite froze at (§15.5 the stop).
+   * through the second parent and leaves the first-parent chain (§5.3). With `below`, the new line
+   * forks from that commit's first parent instead, so the rewrite removes `below` itself — how a
+   * second rewrite takes away the commit an earlier freeze stopped at (§15.5 the stop).
    */
-  forcePush(): void {
+  forcePush(below?: string): void {
     const head = this.git.commits.get(this.git.main)!;
     if (head.parents.length === 0) return;
-    let base = head.parents[0];
-    const deeper = this.rewrites++ > 0 && this.rng() < 0.5 ? this.git.commits.get(base)!.parents[0] : undefined;
-    if (deeper !== undefined) base = deeper;
+    const under = below === undefined ? undefined : this.git.commits.get(below)?.parents[0];
+    const base = under ?? head.parents[0];
+    this.rewrites++;
     const tree = new Map(this.git.tree(base));
     tree.set('README.md', `# Rewritten ${this.int(99)}\n`);
     const other = this.git.commit([base], tree, 'Rewritten history');
@@ -533,6 +544,10 @@ export class World {
 }
 
 // ---- normalised comparison shapes -----------------------------------------------------------
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
 
 export function vec(v: ReadonlyMap<string, number>): Record<string, number> {
   return Object.fromEntries([...v].sort(([a], [b]) => cmp(a, b)));

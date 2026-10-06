@@ -18,6 +18,8 @@ export class SimGit implements HistoryPort {
   main: string;
   /** How many `log` pages have been read — lets a test see whether a poll walked history. */
   logCalls = 0;
+  /** Answer `isAncestor` about a sha that names no commit by rejecting — a host breaking the port's contract. */
+  refuseUnknown = false;
   private counter = 0;
 
   constructor(tree: Tree, message = 'Initial board') {
@@ -92,6 +94,7 @@ export class SimGit implements HistoryPort {
   }
 
   async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    if (this.refuseUnknown && !(this.commits.has(ancestor) && this.commits.has(descendant))) throw new Error('unknown commit');
     return this.reaches(ancestor, descendant);
   }
 

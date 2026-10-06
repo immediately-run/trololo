@@ -47,7 +47,10 @@ export interface OracleInput {
   readonly offered: readonly OracleCommit[];
   /** Git ancestry, reflexive (the simulated history; §15.5 the stop). */
   readonly isAncestor: (ancestor: string, descendant: string) => boolean;
-  /** The batch files the replica holds, with whether each is log-acknowledged. */
+  /**
+   * Every version of a batch file the replica has read, in the order it first read each, with
+   * whether its path is log-acknowledged. The first version of a path keeps the slot.
+   */
   readonly batches: ReadonlyArray<{ path: string; bytes: Uint8Array; acked: boolean }>;
 }
 
@@ -336,10 +339,13 @@ export function oracle(input: OracleInput): OracleResult {
   const { layout, sessionId, offered } = input;
 
   // Slots: one batch per (actor, seq); the replica keeps the first version it saw.
+  const versions: Batch[] = [];
   const slots = new Map<string, Batch>();
   for (const f of input.batches) {
     const b = readBatch(f.path, f.bytes, f.acked);
-    if (b && !slots.has(b.key)) slots.set(b.key, b);
+    if (!b) continue;
+    versions.push(b);
+    if (!slots.has(b.key)) slots.set(b.key, b);
   }
 
   const contiguousBy = (ok: (b: Batch) => boolean): Map<string, number> => {
@@ -354,10 +360,11 @@ export function oracle(input: OracleInput): OracleResult {
   };
   const holding = contiguousBy(() => true);
 
-  // Frozen (§15.5): every `_session/frozen` operation of a control-only batch, plus the freeze an
-  // exhausted log implies — a batch at lamport 2^48 − 1 counts as carrying `{integrity, its base}`
-  // after its own operations. The winner: a freeze that stops the chain outranks a layout freeze;
-  // then §3.8 order.
+  // Frozen (§15.5): every `_session/frozen` operation of a control-only batch that holds its slot,
+  // plus the freeze an exhausted log implies — any version read at lamport 2^48 − 1, a slot's losing
+  // version included, counts as carrying `{integrity, its base}` after its own operations. The
+  // winner: a freeze that stops the chain outranks a layout freeze; then §3.8 order; then the
+  // greater `at`.
   type FreezeCand = { lamport: number; actor: string; seq: number; index: number; value: { reason: string; at: string } };
   const cands: FreezeCand[] = [];
   for (const b of slots.values()) {
@@ -368,7 +375,11 @@ export function oracle(input: OracleInput): OracleResult {
         if (op.path === '_session/frozen') cands.push({ ...at, index, value: op.value as FreezeCand['value'] });
       });
     }
-    if (b.body.lamport === 2 ** 48 - 1) cands.push({ ...at, index: b.body.ops.length, value: { reason: 'integrity', at: b.body.base } });
+  }
+  for (const b of versions) {
+    if (b.body && b.body.lamport === 2 ** 48 - 1) {
+      cands.push({ lamport: b.body.lamport, actor: b.actor, seq: b.seq, index: b.body.ops.length, value: { reason: 'integrity', at: b.body.base } });
+    }
   }
   const beats = (x: FreezeCand, y: FreezeCand): boolean => {
     const sx = x.value.reason !== 'layout';
@@ -377,7 +388,8 @@ export function oracle(input: OracleInput): OracleResult {
     if (x.lamport !== y.lamport) return x.lamport > y.lamport;
     if (x.actor !== y.actor) return lt(y.actor, x.actor);
     if (x.seq !== y.seq) return x.seq > y.seq;
-    return x.index > y.index;
+    if (x.index !== y.index) return x.index > y.index;
+    return lt(y.value.at, x.value.at);
   };
   let frozenWin: FreezeCand | null = null;
   for (const c of cands) if (frozenWin === null || beats(c, frozenWin)) frozenWin = c;

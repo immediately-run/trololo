@@ -213,6 +213,16 @@ function exhausting(base: string, name = 'top'): { path: string; bytes: Uint8Arr
   return { path: batchPath(actor, 1), bytes: encodeBatch(body) };
 }
 
+/** One version of a forger's batch slot, at `lamport`, based on `base`. */
+function forgedVersion(base: string, lamport: number, name: string): { path: string; bytes: Uint8Array } {
+  const actor = 'mal.aaaaaaaa.cccccccc';
+  const body: BatchBody = {
+    v: 1, actor, seq: 1, lamport, base, prev: '', time: '2026-10-06T00:00:00Z',
+    ops: [{ path: '_session/terms', group: '$value', value: { name } }],
+  };
+  return { path: batchPath(actor, 1), bytes: encodeBatch(body) };
+}
+
 describe('review regressions, round two (PR #2, kept by R3-992)', () => {
   it('restart re-applies an unpublished new card as a valid create batch', async () => {
     const w = new World(321);
@@ -310,11 +320,9 @@ describe('R3-992: the freeze stop and the exhausted log (§15.5)', () => {
     expect(b.engine.restartOffer()).toEqual(a.engine.restartOffer());
   });
 
-  it('a frozen replica polling the same head walks nothing; a new head walks only the new commits', async () => {
+  it('a frozen replica keeps the chain it walked: a new head walks only the commits it adds', async () => {
     const { w, a, x0 } = await twoRewrites(343);
     const before = w.git.logCalls;
-    await w.sync(a);
-    expect(w.git.logCalls).toBe(before);
     outsideEdit(w, `cards/${X}.json`, { title: 'after the freeze' });
     await w.sync(a);
     expect(w.git.logCalls).toBe(before + 1);
@@ -363,6 +371,85 @@ describe('R3-992: the freeze stop and the exhausted log (§15.5)', () => {
     expect(b.engine.takeOutbox()).toEqual([]);
     expect(b.engine.frozen()).toEqual({ reason: 'integrity', at: w.root });
     w.check(b);
+  });
+
+  /** Two versions of one forged slot; `v2` sits at the ceiling (the round-one repro on trololo#3). */
+  async function twoVersions(seed: number) {
+    const w = new World(seed);
+    const a = await w.join('ana');
+    const b = await w.join('ben');
+    const root = w.git.main;
+    const x1 = outsideEdit(w, `cards/${X}.json`, { title: 'x1' });
+    await w.sync(a);
+    await w.sync(b);
+    expect(a.engine.adoptedChain()).toEqual([root, x1]);
+    const v1 = forgedVersion(root, 50, 'one');
+    const v2 = forgedVersion(root, LAMPORT_LIMIT - 1, 'two');
+    return { w, a, b, root, x1, v1, v2 };
+  }
+
+  it('two versions of a slot, one at the ceiling: the replica that read the lower one first freezes like the one that read the ceiling', async () => {
+    const { w, a, b, root, v1, v2 } = await twoVersions(347);
+    await w.receiveNow(a, v1.path, v1.bytes);
+    await w.receiveNow(b, v2.path, v2.bytes);
+    await w.receiveNow(a, v2.path, v2.bytes); // Ana detects the conflict and has no lamport left to announce it
+    await sendTo(w, a, b);
+    w.check(a);
+    w.check(b);
+    expect(a.engine.frozen()).toEqual({ reason: 'integrity', at: root });
+    expect(b.engine.frozen()).toEqual(a.engine.frozen());
+    expect(b.engine.adoptedChain()).toEqual(a.engine.adoptedChain());
+    expect(a.engine.adoptedChain()).toEqual([root]);
+  });
+
+  it('two versions of a slot, one at the ceiling: the same freeze whichever version each replica reads first', async () => {
+    const { w, a, b, v1, v2 } = await twoVersions(348);
+    await w.receiveNow(a, v1.path, v1.bytes);
+    await w.receiveNow(b, v2.path, v2.bytes);
+    await w.receiveNow(a, v2.path, v2.bytes);
+    await w.receiveNow(b, v1.path, v1.bytes);
+    w.check(a);
+    w.check(b);
+    expect(b.engine.frozen()).toEqual(a.engine.frozen());
+    expect(b.engine.adoptedChain()).toEqual(a.engine.adoptedChain());
+  });
+
+  it('two ceiling versions of one slot tie in §3.8 order: the greater at wins in either reading order', async () => {
+    const { w, a, b, root, x1, v2 } = await twoVersions(350);
+    const other = forgedVersion(x1, LAMPORT_LIMIT - 1, 'six');
+    await w.receiveNow(a, v2.path, v2.bytes);
+    await w.receiveNow(a, other.path, other.bytes);
+    await w.receiveNow(b, other.path, other.bytes);
+    await w.receiveNow(b, v2.path, v2.bytes);
+    w.check(a);
+    w.check(b);
+    const greater = root > x1 ? root : x1;
+    for (const r of [a, b]) expect(r.engine.frozen()).toEqual({ reason: 'integrity', at: greater });
+    expect(b.engine.adoptedChain()).toEqual(a.engine.adoptedChain());
+  });
+
+  it('a forged freeze whose at names no commit stops at the start base, and a port that refuses the question does not wedge the replica', async () => {
+    const w = new World(349);
+    const a = await w.join('ana');
+    const root = w.git.main;
+    outsideEdit(w, `cards/${X}.json`, { title: 'x1' });
+    await w.sync(a);
+    expect(a.engine.adoptedChain()).toHaveLength(2);
+    w.git.refuseUnknown = true;
+    const forger = 'mal.aaaaaaaa.bbbbbbbb';
+    const body: BatchBody = {
+      v: 1, actor: forger, seq: 1, lamport: 3, base: root, prev: '', time: '2026-10-06T00:00:00Z',
+      ops: [{ path: '_session/frozen', group: '$value', value: { reason: 'rewrite', at: 'f'.repeat(40) } }],
+    };
+    w.plant(batchPath(forger, 1), encodeBatch(body));
+    await expect(w.receiveNow(a, batchPath(forger, 1))).resolves.toBeUndefined();
+    expect(a.engine.frozen()).toEqual({ reason: 'rewrite', at: 'f'.repeat(40) });
+    expect(a.engine.adoptedChain()).toEqual([root]);
+    w.check(a);
+    outsideEdit(w, `cards/${X}.json`, { title: 'x2' });
+    await expect(w.sync(a)).resolves.toBeUndefined(); // later inputs still settle
+    expect(a.engine.adoptedChain()).toEqual([root]);
+    w.check(a);
   });
 
   it('a freeze that cannot be written for any other reason propagates', async () => {

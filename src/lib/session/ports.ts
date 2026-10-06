@@ -27,7 +27,10 @@ export interface HistoryPort {
   head(): Promise<string>;
   /** First-parent log from `from` (inclusive), newest first, at most `limit` entries. */
   log(from: string, limit: number): Promise<LogEntry[]>;
-  /** Reflexive: a commit is an ancestor of itself. */
+  /**
+   * Reflexive: a commit is an ancestor of itself. A sha that names no commit of the bundle — a
+   * freeze's `at` comes from a batch any participant can forge — answers `false`; it never rejects.
+   */
   isAncestor(ancestor: string, descendant: string): Promise<boolean>;
   /** The bundle's files at `sha`. */
   read(sha: string): Promise<Tree>;

@@ -2,7 +2,7 @@
 // frozen state. Outside `Snap`, `C_B`, publish and §5.5; §3.8 last-write-wins, with the freeze
 // precedence rule and the freeze an exhausted log implies (§15.5).
 
-import { compareOrder, CONTROL_GROUP, type Op, type OpRef } from './batch';
+import { cmp, compareOrder, CONTROL_GROUP, type Op, type OpRef } from './batch';
 import type { Json } from './canonical';
 
 export type FreezeReason = 'layout' | 'rewrite' | 'integrity';
@@ -32,13 +32,16 @@ export class ControlState {
   }
 
   /**
-   * A batch at the lamport ceiling has been read (§15.5, an exhausted log): it counts as carrying,
-   * after its own operations, an `integrity` freeze at its base. `ref` is the batch's own order key
-   * with `index` one past its last operation.
+   * A version of a batch file at the lamport ceiling has been read (§15.5, an exhausted log): it
+   * counts as carrying, after its own operations, an `integrity` freeze at its base. `ref` is the
+   * batch's own order key with `index` one past its last operation. Two versions of one slot can tie
+   * in §3.8 order; the greater `at` wins, so the result does not depend on which was read first.
    */
   applyExhausted(ref: OpRef, at: string): void {
     const op: ControlOp = { ...ref, path: FROZEN_PATH, value: { reason: 'integrity', at } };
-    if (!this.implied || outranks(op, this.implied)) this.implied = op;
+    const cur = this.implied;
+    const c = cur ? compareOrder(op, cur) : 1;
+    if (c > 0 || (c === 0 && cmp(at, (cur!.value as { at: string }).at) > 0)) this.implied = op;
   }
 
   /** The winning freeze, written or implied, under the §15.5 precedence rule. */

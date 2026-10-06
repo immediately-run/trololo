@@ -121,7 +121,10 @@ export class SessionEngine {
   private readonly fold: Fold;
   /** The main line's first-parent chain from the start base, as of the last sync — never cut by a stop. */
   private offered: ChainCommit[];
-  /** The head `offered` was walked from; polling the same head again walks nothing (§15.5 stop, unreachable heads). */
+  /**
+   * The head `offered` was last walked from. It differs from `offered`'s tip only when the head's chain
+   * does not reach the start base; remembering it keeps a poll of that head from walking again.
+   */
   private walkedHead: string | null = null;
   /**
    * Index on `offered` past which a rewrite or integrity freeze stops adoption (§15.5 the stop),
@@ -552,6 +555,14 @@ export class SessionEngine {
   private async ingest(path: string, bytes: Uint8Array, hash: string, acked: boolean): Promise<void> {
     const r = decodeBatch(path, bytes, hash);
     if (!parseBatchPath(path)) return; // not a batch file: occupies no slot
+    if (r.body) {
+      // Every version read counts toward the lamport ceiling, a conflicting second version of a slot
+      // included (§15.5, an exhausted log): nobody can write after it, so it implies the freeze itself.
+      this.lamportMax = Math.max(this.lamportMax, r.body.lamport);
+      if (r.body.lamport === LAMPORT_LIMIT - 1) {
+        this.control.applyExhausted({ lamport: r.body.lamport, actor: r.actor, seq: r.seq, index: r.body.ops.length }, r.body.base);
+      }
+    }
     const existing = this.slot(r.actor, r.seq);
     if (existing) {
       if (existing.hash === hash) {
@@ -565,13 +576,6 @@ export class SessionEngine {
     if (!seqs) this.slots.set(r.actor, (seqs = new Map()));
     seqs.set(r.seq, r);
     if (acked) this.acked.add(r.key);
-    if (r.body) {
-      this.lamportMax = Math.max(this.lamportMax, r.body.lamport);
-      // §15.5, an exhausted log: nobody can write after this batch, so it implies the freeze itself.
-      if (r.body.lamport === LAMPORT_LIMIT - 1) {
-        this.control.applyExhausted({ lamport: r.body.lamport, actor: r.actor, seq: r.seq, index: r.body.ops.length }, r.body.base);
-      }
-    }
     if (!r.body) {
       this.states.set(r.key, 'invalid');
       this.reasons.set(r.key, r.shapeError ?? 'invalid');
@@ -599,8 +603,15 @@ export class SessionEngine {
     const f = this.frozen();
     const key = stopsChain(f) ? `${f!.at} ${this.offered[this.offered.length - 1].sha}` : '';
     if (key !== this.stopKey) {
-      this.stopIndex = key === '' ? Infinity : await this.stopOn(f!.at);
-      this.stopKey = key;
+      if (key === '') {
+        this.stopIndex = Infinity;
+        this.stopKey = key;
+      } else {
+        const s = await this.stopOn(f!.at);
+        this.stopIndex = s.index;
+        // An answer built on a refused ancestry question is used now and asked again next time.
+        if (s.answered) this.stopKey = key;
+      }
     }
     if (this.stopIndex >= this.fold.chain.length - 1) return false;
     this.rollbackTo(this.stopIndex);
@@ -610,21 +621,34 @@ export class SessionEngine {
   /**
    * §15.5 the stop: the last commit of the offered chain that is an ancestor of `at`, or the start
    * base when none is. Ancestry is closed under first parents, so the ancestors form a prefix of the
-   * chain and a binary search over `isAncestor` finds its end.
+   * chain and a binary search over `isAncestor` finds its end. `answered` is false when the port
+   * refused a question, which then counted as "not an ancestor".
    */
-  private async stopOn(at: string): Promise<number> {
+  private async stopOn(at: string): Promise<{ index: number; answered: boolean }> {
     const chain = this.offered;
     const exact = chain.findIndex((c) => c.sha === at);
-    if (exact >= 0) return exact;
-    if (!(await this.history.isAncestor(chain[0].sha, at))) return 0;
+    if (exact >= 0) return { index: exact, answered: true };
+    let answered = true;
+    const ancestor = async (sha: string): Promise<boolean> => {
+      try {
+        return await this.history.isAncestor(sha, at);
+      } catch {
+        // The port's contract is `false` for an unknown commit (ports.ts), and `at` is forgeable, so a
+        // host that refuses instead must not wedge every later input. The stop it yields is the lower
+        // one, and it is recomputed at the next settle.
+        answered = false;
+        return false;
+      }
+    };
+    if (!(await ancestor(chain[0].sha))) return { index: 0, answered };
     let lo = 0;
     let hi = chain.length - 1;
     while (lo < hi) {
       const mid = (lo + hi + 1) >> 1;
-      if (await this.history.isAncestor(chain[mid].sha, at)) lo = mid;
+      if (await ancestor(chain[mid].sha)) lo = mid;
       else hi = mid - 1;
     }
-    return lo;
+    return { index: lo, answered };
   }
 
   private tryApply(r: Received): boolean {
