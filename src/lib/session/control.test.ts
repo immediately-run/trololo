@@ -38,4 +38,17 @@ describe('§15.5 control records', () => {
     expect(new Set(results.map((r) => JSON.stringify(r))).size).toBe(1);
     expect(results[0]).toEqual({ reason: 'rewrite', at: AT1 });
   });
+
+  it('written freezes only: a later stop freeze overtakes an earlier one in §3.8 order, and a layout freeze never lifts a stop', () => {
+    const c = new ControlState();
+    c.apply(op(9, FROZEN_PATH, { reason: 'layout', at: AT2 }));
+    c.apply(op(1, FROZEN_PATH, { reason: 'rewrite', at: AT1 }));
+    // The layout freeze sits later in §3.8 order, yet the stop wins (precedence).
+    expect(c.frozen()).toEqual({ reason: 'rewrite', at: AT1 });
+    expect(c.writtenFrozen()).toEqual({ reason: 'rewrite', at: AT1 });
+    // Among written freezes that both stop the chain, plain §3.8 order decides.
+    c.apply(op(5, FROZEN_PATH, { reason: 'integrity', at: AT2 }));
+    expect(c.frozen()).toEqual({ reason: 'integrity', at: AT2 });
+    expect(new ControlState().frozen()).toBeNull();
+  });
 });

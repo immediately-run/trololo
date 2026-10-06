@@ -1,5 +1,7 @@
 // The built-in control record set `_session/` (COLLABORATION_SESSIONS §15.5): terms and the
-// frozen state. Outside `Snap`, `C_B`, publish and §5.5; plain §3.8 last-write-wins.
+// frozen state. Outside `Snap`, `C_B`, publish and §5.5; §3.8 last-write-wins, with the freeze
+// precedence rule over the written freezes. (The freeze an exhausted log implies is OPEN — §15.5
+// "An exhausted log", R3-995 — so written freezes are the only freeze values here.)
 
 import { compareOrder, CONTROL_GROUP, type Op, type OpRef } from './batch';
 import type { Json } from './canonical';
@@ -28,15 +30,27 @@ export class ControlState {
     if (!cur || outranks(op, cur)) this.winners.set(op.path, op);
   }
 
+  /** The winning written freeze, under the §15.5 precedence rule. */
   frozen(): Frozen | null {
-    const v = this.winners.get(FROZEN_PATH)?.value as { reason: FreezeReason; at: string } | undefined;
-    return v ? { reason: v.reason, at: v.at } : null;
+    return asFrozen(this.winners.get(FROZEN_PATH));
+  }
+
+  /** The winning freeze written to the log. Identical to `frozen()` while the implied-freeze
+   *  rule is OPEN (§15.5, R3-995) — kept as the call site the engine's idempotence guard names,
+   *  so R3-995's written/implied split has its seam back. */
+  writtenFrozen(): Frozen | null {
+    return asFrozen(this.winners.get(FROZEN_PATH));
   }
 
   termsName(): string | null {
     const v = this.winners.get(TERMS_PATH)?.value as { name: string } | undefined;
     return v?.name ?? null;
   }
+}
+
+function asFrozen(op: ControlOp | null | undefined): Frozen | null {
+  const v = op?.value as { reason: FreezeReason; at: string } | undefined;
+  return v ? { reason: v.reason, at: v.at } : null;
 }
 
 /**

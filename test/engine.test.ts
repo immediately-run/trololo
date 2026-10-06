@@ -2,12 +2,12 @@
 
 import { describe, expect, it } from 'vitest';
 import { batchPath, encodeBatch, LAMPORT_LIMIT, type BatchBody } from '../src/lib/session/batch';
-import { bootstrapFiles, NotReadyError, SessionEngine } from '../src/lib/session/engine';
+import { bootstrapFiles, LamportExhausted, NotReadyError, SessionEngine } from '../src/lib/session/engine';
 import { layoutFromMarker } from '../src/lib/session/layout';
-import { outsideEdit, place, settle, titleOf } from './sim/helpers';
+import { outsideEdit, place, sendTo, settle, titleOf } from './sim/helpers';
 import { CARDS, COLUMNS, hash, LAYOUT, MARKER, SESSION_ID, World } from './sim/world';
 
-const [X] = CARDS;
+const [X, Y] = CARDS;
 const decode = (b: Uint8Array) => JSON.parse(new TextDecoder().decode(b)) as BatchBody;
 
 describe('integrity failures freeze every replica (§15.6)', () => {
@@ -74,7 +74,7 @@ describe('engine', () => {
   it('issues nothing before the log has been read in full (§3.8)', async () => {
     const w = new World(305);
     const e = new SessionEngine({
-      sessionId: SESSION_ID, layout: LAYOUT, start: w.commitOf(w.root), actor: 'ana.aaaaaaaa.bbbbbbbb',
+      sessionId: SESSION_ID, layout: LAYOUT, start: w.commitOf(w.root), actor: 'ana.aaaaaaaa.bbbbbbbb', history: w.git,
       hash, clock: () => new Date(0), random: () => 0,
     });
     await expect(e.renameCard(X, 'too early')).rejects.toBeInstanceOf(NotReadyError);
@@ -172,7 +172,7 @@ describe('review regressions (PR #1)', () => {
     const w = new World(314);
     w.layoutChange();
     const e = new SessionEngine({
-      sessionId: SESSION_ID, layout: LAYOUT, start: w.commitOf(w.root), actor: 'ana.aaaaaaaa.bbbbbbbb',
+      sessionId: SESSION_ID, layout: LAYOUT, start: w.commitOf(w.root), actor: 'ana.aaaaaaaa.bbbbbbbb', history: w.git,
       hash, clock: () => new Date(0), random: () => 0,
     });
     await e.offer(w.commitOf(w.git.main));
@@ -188,7 +188,7 @@ describe('review regressions (PR #1)', () => {
     expect(a.engine.pending().map((p) => p.group).sort()).toEqual(['created', 'createdBy', 'position', 'title']);
   });
 
-  it('refuses to issue once the lamport space is exhausted rather than send invalid batches', async () => {
+  it('refuses to issue once the lamport space is exhausted, with the typed LamportExhausted (§15.5; the exhausted-log freeze itself is OPEN, R3-995)', async () => {
     const w = new World(316);
     const a = await w.join('ana');
     const b = await w.join('ben');
@@ -196,6 +196,185 @@ describe('review regressions (PR #1)', () => {
     const top = encodeBatch({ ...one, lamport: LAMPORT_LIMIT - 1 });
     // Ben reads a batch at the top of the lamport range (here, a rewritten copy of Ana's first).
     await w.receiveNow(b, batchPath(one.actor, 1), top);
-    await expect(b.engine.renameCard(X, 'y')).rejects.toThrow(/lamport/);
+    // No freeze is implied from a ceiling read (the rule is open) — but no batch can be issued.
+    expect(b.engine.frozen()).toBeNull();
+    await expect(b.engine.renameCard(X, 'y')).rejects.toBeInstanceOf(LamportExhausted);
+    await expect(b.engine.setTerms('no lamport left')).rejects.toBeInstanceOf(LamportExhausted);
+    w.check(b);
+  });
+});
+
+describe('review regressions, round two (PR #2, kept by R3-992)', () => {
+  it('restart re-applies an unpublished new card as a valid create batch', async () => {
+    const w = new World(321);
+    const a = await w.join('ana');
+    await a.engine.createCard({ title: 'Never published', column: COLUMNS[0] });
+    await settle(w);
+    w.layoutChange();
+    await settle(w);
+    const offer = a.engine.restartOffer();
+    expect(offer.map((p) => p.group).sort()).toEqual(['archived', 'created', 'createdBy', 'deleted', 'due', 'position', 'title']);
+    // "Restart session": a new session re-applies the offer in one batch.
+    const w2 = new World(322);
+    const b = await w2.join('ana');
+    const sent = await b.engine.issue(offer.map(({ path, group, value }) => ({ path, group, value })));
+    expect(b.engine.batchState(sent.path)).toBe('applied');
+    expect(b.engine.effectiveBoard().get(offer[0].path)?.exists).toBe(true);
+    w2.collect(b);
+    w2.check(b);
+  });
+
+  it('a head that does not reach the start base is walked once, not on every poll', async () => {
+    const w = new World(325);
+    const a = await w.join('ana');
+    w.git.forcePush(w.git.commit([], new Map(w.git.tree()), 'an unrelated root'));
+    await w.sync(a);
+    expect(a.engine.frozen()?.reason).toBe('rewrite');
+    w.check(a);
+    const after = w.git.logCalls;
+    await w.sync(a);
+    expect(w.git.logCalls).toBe(after);
+    w.check(a);
+  });
+});
+
+describe('R3-992: the freeze stop (§15.5 — the stop; the exhausted-log rule is OPEN, R3-995)', () => {
+  /** Ana adopts x1 and x2 while Ben is offline; a force-push drops x2 (Ana freezes at x1); a second drops x1. */
+  async function twoRewrites(seed: number) {
+    const w = new World(seed);
+    const a = await w.join('ana');
+    const b = await w.join('ben');
+    await b.engine.renameCard(Y, 'Pending everywhere');
+    await settle(w);
+    b.online = false;
+    const x0 = w.git.main;
+    const x1 = outsideEdit(w, `cards/${X}.json`, { title: 'x1' });
+    outsideEdit(w, `cards/${X}.json`, { title: 'x2' });
+    await w.sync(a);
+    expect(a.engine.adoptedChain()).toHaveLength(3);
+    w.check(a);
+    w.git.forcePush(w.git.commit([x1], new Map(w.git.tree(x1)).set('README.md', '# y\n'), 'y'));
+    await w.sync(a);
+    expect(a.engine.frozen()).toEqual({ reason: 'rewrite', at: x1 });
+    expect(a.engine.adoptedChain()).toEqual([x0, x1]);
+    w.check(a);
+    const z1 = w.git.commit([x0], new Map(w.git.tree(x0)).set('README.md', '# z1\n'), 'z1');
+    w.git.forcePush(w.git.commit([z1], new Map(w.git.tree(z1)).set('README.md', '# z2\n'), 'z2'));
+    await w.sync(a);
+    // x1 has left the chain: the stop is the last commit of the chain that is an ancestor of x1.
+    expect(a.engine.frozen()).toEqual({ reason: 'rewrite', at: x1 });
+    expect(a.engine.adoptedChain()).toEqual([x0]);
+    expect(a.engine.offeredChain().map((c) => c.sha)).toEqual([x0]);
+    w.check(a);
+    return { w, a, b, x0, x1 };
+  }
+
+  it('two replicas, two force-pushes: the offline one syncs first, then reads the freeze — both stop at the same commit', async () => {
+    const { w, a, b, x0, x1 } = await twoRewrites(341);
+    b.online = true;
+    await w.sync(b);
+    expect(b.engine.adoptedChain()).toHaveLength(3); // no freeze yet: z1 and z2 adopted
+    w.check(b);
+    await sendTo(w, a, b); // the freeze arrives: Ben rolls back to the stop
+    expect(b.engine.frozen()).toEqual({ reason: 'rewrite', at: x1 });
+    expect(b.engine.adoptedChain()).toEqual([x0]);
+    w.check(b);
+    await settle(w);
+    for (const r of [a, b]) {
+      expect(r.engine.adoptedChain()).toEqual([x0]);
+      expect(await r.engine.publishPlan()).toBeNull();
+    }
+    expect(a.engine.restartOffer()).toEqual(b.engine.restartOffer());
+    expect(a.engine.restartOffer().map((p) => p.value)).toEqual(['Pending everywhere']);
+  });
+
+  it('two replicas, two force-pushes: the offline one reads the freeze first, then syncs', async () => {
+    const { w, a, b, x0, x1 } = await twoRewrites(342);
+    b.online = true;
+    await sendTo(w, a, b);
+    expect(b.engine.frozen()).toEqual({ reason: 'rewrite', at: x1 });
+    w.check(b);
+    await w.sync(b);
+    expect(b.engine.adoptedChain()).toEqual([x0]);
+    w.check(b);
+    await settle(w);
+    expect(b.engine.restartOffer()).toEqual(a.engine.restartOffer());
+  });
+
+  it('a frozen replica keeps the chain it walked: a new head walks only the commits it adds', async () => {
+    const { w, a, x0 } = await twoRewrites(343);
+    const before = w.git.logCalls;
+    outsideEdit(w, `cards/${X}.json`, { title: 'after the freeze' });
+    await w.sync(a);
+    expect(w.git.logCalls).toBe(before + 1);
+    expect(a.engine.adoptedChain()).toEqual([x0]);
+    w.check(a);
+  });
+
+  it('a forged freeze whose at names no commit stops at the start base, and a port that refuses the question does not wedge the replica', async () => {
+    const w = new World(349);
+    const a = await w.join('ana');
+    const root = w.git.main;
+    outsideEdit(w, `cards/${X}.json`, { title: 'x1' });
+    await w.sync(a);
+    expect(a.engine.adoptedChain()).toHaveLength(2);
+    w.git.refuseUnknown = true;
+    const forger = 'mal.aaaaaaaa.bbbbbbbb';
+    const body: BatchBody = {
+      v: 1, actor: forger, seq: 1, lamport: 3, base: root, prev: '', time: '2026-10-06T00:00:00Z',
+      ops: [{ path: '_session/frozen', group: '$value', value: { reason: 'rewrite', at: 'f'.repeat(40) } }],
+    };
+    w.plant(batchPath(forger, 1), encodeBatch(body));
+    await expect(w.receiveNow(a, batchPath(forger, 1))).resolves.toBeUndefined();
+    expect(a.engine.frozen()).toEqual({ reason: 'rewrite', at: 'f'.repeat(40) });
+    expect(a.engine.adoptedChain()).toEqual([root]);
+    w.check(a);
+    outsideEdit(w, `cards/${X}.json`, { title: 'x2' });
+    await expect(w.sync(a)).resolves.toBeUndefined(); // later inputs still settle
+    expect(a.engine.adoptedChain()).toEqual([root]);
+    w.check(a);
+  });
+
+  it('a stop computed on a refused ancestry question is asked again by a poll of the same head', async () => {
+    const w = new World(355);
+    const a = await w.join('ana');
+    const root = w.git.main;
+    const x1 = outsideEdit(w, `cards/${X}.json`, { title: 'x1' });
+    const x2 = outsideEdit(w, `cards/${X}.json`, { title: 'x2' });
+    await w.sync(a);
+    expect(a.engine.adoptedChain()).toEqual([root, x1, x2]);
+    // A freeze at a side commit off x2: off the chain, so the stop needs the ancestry search.
+    const side = w.git.commit([x2], new Map(w.git.tree(x2)), 'side');
+    const forger = 'mal.aaaaaaaa.eeeeeeee';
+    const body: BatchBody = {
+      v: 1, actor: forger, seq: 1, lamport: 3, base: root, prev: '', time: '2026-10-06T00:00:00Z',
+      ops: [{ path: '_session/frozen', group: '$value', value: { reason: 'rewrite', at: side } }],
+    };
+    w.plant(batchPath(forger, 1), encodeBatch(body));
+    w.git.refuseNext = 1000; // the history verb is down for the whole of this input
+    await w.receiveNow(a, batchPath(forger, 1));
+    expect(a.engine.adoptedChain()).toEqual([root]); // the refusal counted as "not an ancestor"
+    w.git.refuseNext = 0;
+    await w.sync(a); // the same head: nothing to walk, but the stop is asked again
+    expect(a.engine.adoptedChain()).toEqual([root, x1, x2]);
+    w.check(a);
+    const calls = w.git.logCalls;
+    await w.sync(a);
+    expect(w.git.logCalls).toBe(calls);
+    w.check(a);
+  });
+
+  it('a freeze that cannot be written for any other reason propagates', async () => {
+    const w = new World(346);
+    let failing = false;
+    const e = new SessionEngine({
+      sessionId: SESSION_ID, layout: LAYOUT, start: w.commitOf(w.root), actor: 'ana.aaaaaaaa.bbbbbbbb', history: w.git,
+      hash: (bytes) => (failing ? Promise.reject(new Error('hashing failed')) : hash(bytes)), clock: () => new Date(0), random: () => 0,
+    });
+    await e.markLogRead();
+    w.layoutChange();
+    failing = true;
+    await expect(e.sync()).rejects.toThrow('hashing failed');
+    expect(e.frozen()).toBeNull();
   });
 });

@@ -30,6 +30,14 @@ interface Coverage {
   supersededRuns: number;
   unfrozenRuns: number;
   frozenRuns: number;
+  twoFreezeRuns: number;
+  twoRewriteRuns: number;
+  stopOffChainRuns: number;
+}
+
+/** The `at` of a freeze that stops the chain, as some replica holds it: what a second rewrite removes. */
+function stopAt(rs: readonly Replica[]): string | undefined {
+  return rs.map((x) => x.engine.frozen()).find((f) => f !== null && f.reason !== 'layout')?.at;
 }
 
 async function run(seed: number, replicas: number, actions: number[], cov?: Coverage): Promise<World> {
@@ -38,13 +46,23 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
   const rs: Replica[] = [];
   for (let i = 0; i < replicas; i++) rs.push(await w.join(logins[i]));
 
-  // A layout change or a rewrite freezes the session for good; keep at most one per run, in the
-  // last third, so most of a run exercises a live session.
-  let freezer = false;
+  // A layout change or a rewrite freezes the session for good; keep at most two per run, in the
+  // last third, so most of a run exercises a live session and some runs rewrite twice (§15.5 the stop).
+  let freezers = 0;
   for (const [i, a] of actions.entries()) {
     const r = rs[w.int(rs.length)];
     const late = i >= (actions.length * 2) / 3;
-    if (a < 30) await w.edit(r);
+    if (late && freezers === 1 && w.rewrites === 1 && a >= 73 && a < 88) {
+      // After one late rewrite, an outside change or a publish is instead: a sync, until the rewrite
+      // has frozen someone; then a second rewrite that removes the commit that freeze stopped at
+      // (§15.5 the stop).
+      const at = stopAt(rs);
+      if (at !== undefined) {
+        freezers++;
+        w.forcePush(at);
+      } else await w.sync(r);
+    }
+    else if (a < 30) await w.edit(r);
     else if (a < 42) w.write(r);
     else if (a < 50) w.resolve(r);
     else if (a < 65) await w.deliver(r, 1 + w.int(4));
@@ -61,10 +79,10 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
     else if (a < 91) r.online = !r.online;
     else if (a === 91) await w.reload(r);
     else if (a === 92 || a === 93) {
-      if (late && !freezer) {
-        freezer = true;
+      if (late && freezers < 2) {
+        freezers++;
         if (a === 92) w.layoutChange();
-        else w.forcePush();
+        else w.forcePush(stopAt(rs));
       } else await w.deliver(r, Infinity);
     }
     else await w.deliver(r, Infinity);
@@ -80,6 +98,9 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
     if (rs.some((r) => r.engine.superseded().length > 0)) cov.supersededRuns++;
     if (rs[0].engine.frozen() === null) cov.unfrozenRuns++;
     else cov.frozenRuns++;
+    if (freezers === 2) cov.twoFreezeRuns++;
+    if (w.rewrites === 2) cov.twoRewriteRuns++;
+    if (w.stopOffChain) cov.stopOffChainRuns++;
   }
   return w;
 }
@@ -90,7 +111,7 @@ describe('convergence', () => {
   });
 
   it(`random sessions converge to the oracle (${RUNS} runs)`, async () => {
-    const cov: Coverage = { publishes: 0, conflicts: 0, merges: 0, reloads: 0, supersededRuns: 0, unfrozenRuns: 0, frozenRuns: 0 };
+    const cov: Coverage = { publishes: 0, conflicts: 0, merges: 0, reloads: 0, supersededRuns: 0, unfrozenRuns: 0, frozenRuns: 0, twoFreezeRuns: 0, twoRewriteRuns: 0, stopOffChainRuns: 0 };
     await fc.assert(
       fc.asyncProperty(
         fc.integer({ min: 1, max: 2 ** 31 - 1 }),
@@ -112,6 +133,10 @@ describe('convergence', () => {
     expect(cov.supersededRuns).toBeGreaterThan(RUNS / 10);
     expect(cov.unfrozenRuns).toBeGreaterThan(RUNS / 2);
     expect(cov.frozenRuns).toBeGreaterThan(RUNS / 50);
+    expect(cov.twoFreezeRuns).toBeGreaterThan(RUNS / 200);
+    expect(cov.twoRewriteRuns).toBeGreaterThan(0);
+    // A second rewrite removes the winning stop's `at`: the stop's ancestry search (§15.5).
+    expect(cov.stopOffChainRuns).toBeGreaterThan(RUNS / 250);
     console.info('convergence coverage', cov);
   });
 });
