@@ -400,6 +400,32 @@ export class World {
     return groups.size;
   }
 
+  /**
+   * For coverage: the read-set groups, and how many groups of two or more replicas hold an
+   * implied-freeze input (a second version, or a ceiling version) in what they read.
+   */
+  sameSetStats(): { groups: number; impliedPairs: number } {
+    const groups = new Map<string, Replica[]>();
+    for (const r of this.replicas) {
+      const k = `${this.readSet(r)}\n@${r.syncedHead}`;
+      groups.set(k, [...(groups.get(k) ?? []), r]);
+    }
+    const ceiling = (bytes: Uint8Array) => {
+      try {
+        return (JSON.parse(new TextDecoder().decode(bytes)) as { lamport?: number }).lamport === LAMPORT_LIMIT - 1;
+      } catch {
+        return false;
+      }
+    };
+    let impliedPairs = 0;
+    for (const [, rs] of groups) {
+      if (rs.length < 2) continue;
+      const r = rs[0];
+      if (r.extra.length > 0 || [...r.seen.values()].some(ceiling)) impliedPairs++;
+    }
+    return { groups: groups.size, impliedPairs };
+  }
+
   checkConverged(): void {
     for (const r of this.replicas) this.check(r);
     this.checkSameSets();

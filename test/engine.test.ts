@@ -550,6 +550,28 @@ describe('R3-995: an exhausted log and a slot read in two versions freeze at the
     allStartBase(w, [a, b, carl]);
   });
 
+  it('near misses imply nothing: one below the ceiling, a ceiling file with an unknown key, a path that disagrees with its body, a 16-digit seq', async () => {
+    const w = new World(6995);
+    const a = await w.join('ana');
+    const b = await w.join('ben');
+    const root = w.git.main;
+    const below = fv(SLOT, root, LAMPORT_LIMIT - 2, 'below');
+    w.plant(below.path, below.bytes);
+    const extraKey = JSON.parse(new TextDecoder().decode(fv(OTHER, root, LAMPORT_LIMIT - 1, 'extra').bytes));
+    w.plant(batchPath(OTHER, 1), new TextEncoder().encode(JSON.stringify({ ...extraKey, surplus: 1 }) + '\n'));
+    const mismatched = fv('mal.aaaaaaaa.eeeeeeee', root, LAMPORT_LIMIT - 1, 'mismatch');
+    w.plant(batchPath('mal.aaaaaaaa.ffffffff', 1), mismatched.bytes); // body names another actor
+    // 16 digits, body and path agreeing: still not a batch file (§15.5 caps `<seq>` at 15 digits).
+    const longSeq = 1_000_000_000_000_000;
+    const longBody: BatchBody = { v: 1, actor: 'mal.aaaaaaaa.gggggggg', seq: longSeq, lamport: LAMPORT_LIMIT - 1, base: root, prev: 'a'.repeat(64), time: '2026-10-06T12:00:00.000Z', ops: [{ path: `cards/${X}.json`, group: 'title', value: 'long' }] };
+    w.plant(`batches/mal.aaaaaaaa.gggggggg/${longSeq}.json`, encodeBatch(longBody));
+    await w.quiesce();
+    for (const r of [a, b]) {
+      w.check(r);
+      expect(r.engine.frozen()).toBeNull();
+    }
+  });
+
   it('the announcement is written even when another stop freeze is in force, and outranks one ranked above it in §3.8', async () => {
     const { w, a, b, root, x1 } = await twoOnX1(5995);
     // A written rewrite freeze at x1 is in force first.

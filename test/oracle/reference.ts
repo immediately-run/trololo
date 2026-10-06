@@ -132,7 +132,8 @@ function before(a: Op, b: Op): boolean {
 // ---- §15.5 batch files ----------------------------------------------------------------------
 
 function readBatch(path: string, bytes: Uint8Array, acked: boolean): Batch | null {
-  const m = /^batches\/([A-Za-z0-9-]{1,39}\.[0-9a-z]{8}\.[0-9a-z]{8})\/([1-9][0-9]*)\.json$/.exec(path);
+  // §15.5: `<seq>` is a positive integer of at most 15 digits; any other path is not a batch file.
+  const m = /^batches\/([A-Za-z0-9-]{1,39}\.[0-9a-z]{8}\.[0-9a-z]{8})\/([1-9][0-9]{0,14})\.json$/.exec(path);
   if (!m) return null;
   const actor = m[1];
   const seq = Number(m[2]);

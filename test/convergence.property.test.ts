@@ -38,6 +38,8 @@ interface Coverage {
   secondVersionRuns: number;
   splitRuns: number;
   sameSetGroupsSplit: number;
+  combinedRuns: number;
+  sameSetImpliedPairs: number;
 }
 
 /** The `at` of a freeze that stops the chain, as some replica holds it: what a second rewrite removes. */
@@ -84,9 +86,11 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
     }
     else if (a < 91) r.online = !r.online;
     else if (a === 91) await w.reload(r);
-    else if ((a === 94 || a === 95) && late && plants < 1 && w.rng() < 0.6) {
+    else if ((a === 94 || a === 95) && late && plants < 3 && w.rng() < 0.6) {
       // The exhausted-log class (§15.5, R3-995): a ceiling batch, or a second version of a stored
-      // batch file, stored or served to some replicas only. Rare, late, at most one per run.
+      // batch file, stored or served to some replicas only. Rare, late, at most three per run, so
+      // some runs combine them (the P1–P3 shapes: a ceiling batch beside a second version, or a
+      // second version of a ceiling batch).
       plants++;
       if (a === 94) await w.plantCeiling();
       else await w.plantSecondVersion();
@@ -118,7 +122,10 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
     if (w.ceilingPlants) cov.ceilingRuns++;
     if (w.secondVersions) cov.secondVersionRuns++;
     if (w.splitServes) cov.splitRuns++;
-    if (w.checkSameSets() > 1) cov.sameSetGroupsSplit++;
+    const sets = w.sameSetStats();
+    if (sets.groups > 1) cov.sameSetGroupsSplit++;
+    if (sets.impliedPairs > 0) cov.sameSetImpliedPairs++;
+    if (w.ceilingPlants + w.secondVersions >= 2 && w.ceilingPlants > 0 && w.secondVersions > 0) cov.combinedRuns++;
   }
   return w;
 }
@@ -129,7 +136,7 @@ describe('convergence', () => {
   });
 
   it(`random sessions converge to the oracle (${RUNS} runs)`, async () => {
-    const cov: Coverage = { publishes: 0, conflicts: 0, merges: 0, reloads: 0, supersededRuns: 0, unfrozenRuns: 0, frozenRuns: 0, twoFreezeRuns: 0, twoRewriteRuns: 0, stopOffChainRuns: 0, mixedBatches: 0, ceilingRuns: 0, secondVersionRuns: 0, splitRuns: 0, sameSetGroupsSplit: 0 };
+    const cov: Coverage = { publishes: 0, conflicts: 0, merges: 0, reloads: 0, supersededRuns: 0, unfrozenRuns: 0, frozenRuns: 0, twoFreezeRuns: 0, twoRewriteRuns: 0, stopOffChainRuns: 0, mixedBatches: 0, ceilingRuns: 0, secondVersionRuns: 0, splitRuns: 0, sameSetGroupsSplit: 0, combinedRuns: 0, sameSetImpliedPairs: 0 };
     await fc.assert(
       fc.asyncProperty(
         fc.integer({ min: 1, max: 2 ** 31 - 1 }),
@@ -163,6 +170,11 @@ describe('convergence', () => {
     expect(cov.secondVersionRuns).toBeGreaterThan(RUNS / 50);
     expect(cov.splitRuns).toBeGreaterThan(RUNS / 50);
     expect(cov.sameSetGroupsSplit).toBeGreaterThan(RUNS / 100);
+    // A run where two or more replicas read the same versions AND those versions hold an implied-
+    // freeze input — the pairs the same-set assertion is about.
+    expect(cov.sameSetImpliedPairs).toBeGreaterThan(RUNS / 50);
+    // A ceiling batch and a second version in one run.
+    expect(cov.combinedRuns).toBeGreaterThan(0);
     console.info('convergence coverage', cov);
   });
 });
