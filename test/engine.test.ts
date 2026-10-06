@@ -199,3 +199,74 @@ describe('review regressions (PR #1)', () => {
     await expect(b.engine.renameCard(X, 'y')).rejects.toThrow(/lamport/);
   });
 });
+
+describe('review regressions, round two (PR #2)', () => {
+  it('restart re-applies an unpublished new card as a valid create batch', async () => {
+    const w = new World(321);
+    const a = await w.join('ana');
+    await a.engine.createCard({ title: 'Never published', column: COLUMNS[0] });
+    await settle(w);
+    w.layoutChange();
+    await settle(w);
+    const offer = a.engine.restartOffer();
+    expect(offer.map((p) => p.group).sort()).toEqual(['archived', 'created', 'createdBy', 'deleted', 'due', 'position', 'title']);
+    // "Restart session": a new session re-applies the offer in one batch.
+    const w2 = new World(322);
+    const b = await w2.join('ana');
+    const sent = await b.engine.issue(offer.map(({ path, group, value }) => ({ path, group, value })));
+    expect(b.engine.batchState(sent.path)).toBe('applied');
+    expect(b.engine.effectiveBoard().get(offer[0].path)?.exists).toBe(true);
+  });
+
+  it('a second rewrite that removes the freeze point does not let the chain advance', async () => {
+    const w = new World(323);
+    const a = await w.join('ana');
+    const x0 = w.git.main;
+    const x1 = w.git.advance(new Map(w.git.tree()).set('README.md', '# x1\n'), 'x1');
+    w.git.advance(new Map(w.git.tree()).set('README.md', '# x2\n'), 'x2');
+    await w.sync(a);
+    w.git.forcePush(w.git.commit([x1], new Map(w.git.tree(x1)).set('README.md', '# y\n'), 'y'));
+    await w.sync(a);
+    expect(a.engine.frozen()).toEqual({ reason: 'rewrite', at: x1 });
+    const z1 = w.git.commit([x0], new Map(w.git.tree(x0)).set('README.md', '# z1\n'), 'z1');
+    w.git.forcePush(w.git.commit([z1], new Map(w.git.tree(z1)).set('README.md', '# z2\n'), 'z2'));
+    await w.sync(a);
+    await w.sync(a);
+    expect(a.engine.frozen()).toEqual({ reason: 'rewrite', at: x1 });
+    expect(a.engine.adoptedChain()).toEqual([x0]);
+  });
+
+  it('a replica that cannot write any more batches still freezes on an integrity failure', async () => {
+    const w = new World(324);
+    const a = await w.join('ana');
+    const b = await w.join('ben');
+    const one = decode((await a.engine.renameCard(X, 'x')).bytes);
+    const top = encodeBatch({ ...one, lamport: LAMPORT_LIMIT - 1 });
+    await w.receiveNow(b, batchPath(one.actor, 1), top);
+    // A second version of the same slot: an integrity failure Ben cannot announce.
+    const other = encodeBatch({ ...one, lamport: LAMPORT_LIMIT - 1, ops: [{ path: `cards/${X}.json`, group: 'title', value: 'y' }] });
+    await expect(w.receiveNow(b, batchPath(one.actor, 1), other)).resolves.toBeUndefined();
+    expect(b.engine.frozen()?.reason).toBe('integrity');
+    expect(await b.engine.publishPlan()).toBeNull();
+  });
+
+  it('a head that does not reach the start base is walked once, not on every poll', async () => {
+    const w = new World(325);
+    const a = await w.join('ana');
+    let logs = 0;
+    const history = {
+      head: () => w.git.head(),
+      log: (from: string, limit: number) => (logs++, w.git.log(from, limit)),
+      isAncestor: (x: string, y: string) => w.git.isAncestor(x, y),
+      read: (sha: string) => w.git.read(sha),
+      diffPaths: (x: string, y: string) => w.git.diffPaths(x, y),
+    };
+    w.git.forcePush(w.git.commit([], new Map(w.git.tree()), 'an unrelated root'));
+    await a.engine.sync(history);
+    expect(a.engine.frozen()?.reason).toBe('rewrite');
+    const after = logs;
+    await a.engine.sync(history);
+    expect(logs).toBe(after);
+  });
+});
+
