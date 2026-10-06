@@ -422,4 +422,19 @@ describe('R3-998: control operations in a mixed batch are inert (§15.5)', () =>
       expect(r.engine.frozen()?.reason).toBe('rewrite');
     }
   });
+  it('a mixed batch with a malformed control operation is invalid in its entirety, like any batch of the wrong shape', async () => {
+    const w = new World(2998);
+    const a = await w.join('ana');
+    const b = await w.join('ben');
+    const sent = await a.engine.issue([
+      { path: `cards/${X}.json`, group: 'title', value: 'Must not apply' },
+      { path: '_session/frozen', group: '$value', value: { reason: 'bogus', at: w.git.main } },
+    ]);
+    await settle(w);
+    for (const r of [a, b]) {
+      expect(r.engine.batchState(sent.path)).toBe('invalid');
+      expect(r.engine.frozen()).toBeNull();
+      expect(titleOf(r.engine, X)).not.toBe('Must not apply');
+    }
+  });
 });
