@@ -33,6 +33,7 @@ interface Coverage {
   twoFreezeRuns: number;
   twoRewriteRuns: number;
   stopOffChainRuns: number;
+  mixedBatches: number;
 }
 
 /** The `at` of a freeze that stops the chain, as some replica holds it: what a second rewrite removes. */
@@ -101,6 +102,7 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
     if (freezers === 2) cov.twoFreezeRuns++;
     if (w.rewrites === 2) cov.twoRewriteRuns++;
     if (w.stopOffChain) cov.stopOffChainRuns++;
+    cov.mixedBatches += w.mixed;
   }
   return w;
 }
@@ -111,7 +113,7 @@ describe('convergence', () => {
   });
 
   it(`random sessions converge to the oracle (${RUNS} runs)`, async () => {
-    const cov: Coverage = { publishes: 0, conflicts: 0, merges: 0, reloads: 0, supersededRuns: 0, unfrozenRuns: 0, frozenRuns: 0, twoFreezeRuns: 0, twoRewriteRuns: 0, stopOffChainRuns: 0 };
+    const cov: Coverage = { publishes: 0, conflicts: 0, merges: 0, reloads: 0, supersededRuns: 0, unfrozenRuns: 0, frozenRuns: 0, twoFreezeRuns: 0, twoRewriteRuns: 0, stopOffChainRuns: 0, mixedBatches: 0 };
     await fc.assert(
       fc.asyncProperty(
         fc.integer({ min: 1, max: 2 ** 31 - 1 }),
@@ -137,6 +139,8 @@ describe('convergence', () => {
     expect(cov.twoRewriteRuns).toBeGreaterThan(0);
     // A second rewrite removes the winning stop's `at`: the stop's ancestry search (§15.5).
     expect(cov.stopOffChainRuns).toBeGreaterThan(RUNS / 250);
+    // Mixed content+control batches, a freeze mid-batch (§15.5: their control operations are inert).
+    expect(cov.mixedBatches).toBeGreaterThan(RUNS / 4);
     console.info('convergence coverage', cov);
   });
 });

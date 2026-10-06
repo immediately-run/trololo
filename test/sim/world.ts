@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
 import { cmp, type Op } from '../../src/lib/session/batch';
 import type { Json } from '../../src/lib/session/canonical';
+import { frozenOp, termsOp } from '../../src/lib/session/control';
 import { SessionEngine, type OutgoingBatch } from '../../src/lib/session/engine';
 import type { Board, Status } from '../../src/lib/session/fold';
 import { parseLayout, type Layout } from '../../src/lib/session/layout';
@@ -101,6 +102,8 @@ export class World {
   merges = 0;
   reloads = 0;
   rewrites = 0;
+  /** Mixed content+control batches issued (§15.5: their control operations are inert). */
+  mixed = 0;
   /** A check saw a replica whose winning stop freeze has its `at` off the chain (the stop's ancestry search). */
   stopOffChain = false;
 
@@ -427,7 +430,15 @@ export class World {
           if (col) await e.moveColumn(col.id, this.int(cols.length));
           break;
         case 14:
-          await e.issue([{ path: 'board.json', group: 'name', value: `Board ${this.int(9)}` }]);
+          // A mixed batch (§15.5): its control operations — a freeze mid-batch, terms last — are
+          // inert, so engine and oracle must both see only the rename. (No extra draw from the
+          // generator: pinned seeds replay as before.)
+          await e.issue([
+            { path: 'board.json', group: 'name', value: `Board ${this.int(9)}` },
+            frozenOp('integrity', this.git.main),
+            termsOp('Mixed'),
+          ]);
+          this.mixed++;
           break;
         case 15:
           await e.issue(this.invalidOps(card?.path ?? `cards/${CARDS[0]}.json`));

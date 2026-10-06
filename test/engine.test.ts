@@ -3,6 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import { batchPath, encodeBatch, LAMPORT_LIMIT, type BatchBody } from '../src/lib/session/batch';
 import { bootstrapFiles, LamportExhausted, NotReadyError, SessionEngine } from '../src/lib/session/engine';
+import { frozenOp, termsOp } from '../src/lib/session/control';
 import { layoutFromMarker } from '../src/lib/session/layout';
 import { outsideEdit, place, sendTo, settle, titleOf } from './sim/helpers';
 import { CARDS, COLUMNS, hash, LAYOUT, MARKER, SESSION_ID, World } from './sim/world';
@@ -376,5 +377,67 @@ describe('R3-992: the freeze stop (§15.5 — the stop; the exhausted-log rule i
     failing = true;
     await expect(e.sync()).rejects.toThrow('hashing failed');
     expect(e.frozen()).toBeNull();
+  });
+});
+
+describe('R3-998: control operations in a mixed batch are inert (§15.5)', () => {
+  it('a mixed batch carrying a freeze mid-batch applies its content and freezes nobody', async () => {
+    const w = new World(998);
+    const a = await w.join('ana');
+    const b = await w.join('ben');
+    const sent = await a.engine.issue([
+      { path: `cards/${X}.json`, group: 'title', value: 'Mixed content' },
+      frozenOp('integrity', w.git.main),
+      termsOp('Mixed terms'),
+    ]);
+    await settle(w); // every replica against every other and against the oracle
+    for (const r of [a, b]) {
+      expect(r.engine.batchState(sent.path)).toBe('applied');
+      expect(r.engine.frozen()).toBeNull();
+      expect(r.engine.termsName()).toBeNull();
+      expect(titleOf(r.engine, X)).toBe('Mixed content');
+      expect(await r.engine.publishPlan()).not.toBeNull();
+    }
+  });
+
+  it('a mixed batch rolled back by a rewrite leaves no freeze behind on the replica that applied it', async () => {
+    const w = new World(1998);
+    const a = await w.join('ana');
+    const b = await w.join('ben');
+    const before = w.git.main;
+    outsideEdit(w, `cards/${Y}.json`, { title: 'Soon gone' });
+    await w.sync(a); // Ana adopts it; Ben never sees it
+    // Based on the commit the rewrite removes: Ana applies it, then holds it again after the rollback.
+    const sent = await a.engine.issue([
+      { path: `cards/${X}.json`, group: 'title', value: 'Held again' },
+      frozenOp('layout', w.git.main),
+      termsOp('Held terms'),
+    ]);
+    expect(a.engine.batchState(sent.path)).toBe('applied');
+    expect(a.engine.frozen()).toBeNull();
+    w.git.forcePush(w.git.commit([before], new Map(w.git.tree(before)).set('README.md', '# rewritten\n'), 'Rewrite'));
+    await settle(w);
+    for (const r of [a, b]) {
+      expect(r.engine.batchState(sent.path)).toBe('held');
+      // The rewrite's own freeze, identical everywhere. It would outrank a leftover layout freeze
+      // by precedence, so the terms op is what proves nothing of the batch's control state stayed.
+      expect(r.engine.frozen()?.reason).toBe('rewrite');
+      expect(r.engine.termsName()).toBeNull();
+    }
+  });
+  it('a mixed batch with a malformed control operation is invalid in its entirety, like any batch of the wrong shape', async () => {
+    const w = new World(2998);
+    const a = await w.join('ana');
+    const b = await w.join('ben');
+    const sent = await a.engine.issue([
+      { path: `cards/${X}.json`, group: 'title', value: 'Must not apply' },
+      { path: '_session/frozen', group: '$value', value: { reason: 'bogus', at: w.git.main } },
+    ]);
+    await settle(w);
+    for (const r of [a, b]) {
+      expect(r.engine.batchState(sent.path)).toBe('invalid');
+      expect(r.engine.frozen()).toBeNull();
+      expect(titleOf(r.engine, X)).not.toBe('Must not apply');
+    }
   });
 });

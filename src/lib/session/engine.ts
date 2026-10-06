@@ -694,7 +694,9 @@ export class SessionEngine {
       });
     });
     this.fold.apply(ops);
-    this.applyControl(body);
+    // Control operations in a batch that also carries content are inert (§15.5): a content batch
+    // can be rolled back and held again (§5.4 d), and a control value that came and went with it
+    // would split the replicas that applied it from those that never did.
     this.states.set(r.key, 'applied');
     return true;
   }
