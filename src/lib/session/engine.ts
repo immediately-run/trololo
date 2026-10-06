@@ -782,9 +782,10 @@ export class SessionEngine {
     }
     this.announcePending = false;
     const w = this.control.writtenFrozen();
-    if (this.announced || (w !== null && w.reason === 'integrity' && w.at === this.offered[0].sha)) return;
+    const sb = this.control.startBaseFreeze();
+    if (this.announced || (w !== null && w.reason === sb.reason && w.at === sb.at)) return;
     try {
-      await this.issueUnlocked([frozenOp('integrity', this.offered[0].sha)]);
+      await this.issueUnlocked([frozenOp(sb.reason, sb.at)]);
     } catch (err) {
       if (err instanceof LamportExhausted) return;
       throw err;

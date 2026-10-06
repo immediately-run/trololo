@@ -373,7 +373,6 @@ export class World {
     throw new Error('the world did not quiesce');
   }
 
-  /** After quiescence every replica derives the same state, and it is the oracle's. */
   /** The versions a replica has read, as a comparable key: every path with every version's hash. */
   readSet(r: Replica): string {
     const hex = (b: Uint8Array) => Buffer.from(b).toString('base64');
@@ -404,7 +403,7 @@ export class World {
    * For coverage: the read-set groups, and how many groups of two or more replicas hold an
    * implied-freeze input (a second version, or a ceiling version) in what they read.
    */
-  sameSetStats(): { groups: number; impliedPairs: number } {
+  sameSetStats(): { groups: number; impliedPairs: number; orderSplits: number } {
     const groups = new Map<string, Replica[]>();
     for (const r of this.replicas) {
       const k = `${this.readSet(r)}\n@${r.syncedHead}`;
@@ -418,14 +417,21 @@ export class World {
       }
     };
     let impliedPairs = 0;
+    let orderSplits = 0;
     for (const [, rs] of groups) {
       if (rs.length < 2) continue;
       const r = rs[0];
       if (r.extra.length > 0 || [...r.seen.values()].some(ceiling)) impliedPairs++;
+      // The same versions read, but a slot kept in a different version (read in another order).
+      if (rs.some((o) => [...o.seen].some(([p, b]) => !sameBytes(b, r.seen.get(p) ?? new Uint8Array())))) orderSplits++;
     }
-    return { groups: groups.size, impliedPairs };
+    return { groups: groups.size, impliedPairs, orderSplits };
   }
 
+  /**
+   * After quiescence every replica agrees with its oracle; replicas that read the same versions
+   * agree on the freeze and the chain; and replicas served nothing out of band agree on everything.
+   */
   checkConverged(): void {
     for (const r of this.replicas) this.check(r);
     this.checkSameSets();
@@ -478,7 +484,11 @@ export class World {
     if (!everyone) this.splitServes++;
     for (const r of targets) {
       r.unstored = true;
-      await this.receiveNow(r, path, bytes);
+      // Out of band, beside the space: the stored version stays in the replica's inbox, so some
+      // replicas read it before this one and some after (§15.5: the order must not matter).
+      await r.engine.receive(path, bytes);
+      this.see(r, path, bytes, true);
+      this.collect(r);
     }
   }
 
