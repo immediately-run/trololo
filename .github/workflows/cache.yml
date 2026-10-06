@@ -1,0 +1,342 @@
+# Publishes a pre-cached zip of this repo to its own GitHub Pages on every push
+# to main, so immediately.run can load it fast — without hitting the GitHub API
+# (slow, and rate-limited for anonymous users). immediately.run looks for the
+# zip at https://<owner>.github.io/<repo>/cached_repositories/<branch>.zip — and,
+# for a commit-pinned library mount, cached_repositories/<sha>.zip — and
+# falls back to the API if it's absent.
+#
+# The zip is built by `@immediately-run/cli cache-zip`, which embeds a
+# contribute-manifest sidecar so edits made on immediately.run can still be
+# pushed back to GitHub offline.
+#
+# It also embeds the resolved-dependency LOCKSET and, since R3-567, the dependency
+# CONTENT (--bundle-packages) — so a repo boots without the sandbox having to resolve or
+# fetch its dependencies live. `npm ci` runs first because cache-zip fills the dependency
+# CDN's gaps from `node_modules`: the CDN cannot resolve a version its npm mirror has not
+# ingested, and that is always a FRESH publish, which is always the one sitting in the
+# installed tree.
+#
+# --bundle-packages was opt-in because "a default-on bundle could bloat the zip past the
+# host size cap". The caps are 50 MB on the response body and 250 MB decompressed
+# (ZIP_CACHE_AUTOMATION_SPEC §8). Measured on landing-page with every package sourced from
+# node_modules — 9 packages including react-dom and lucide-react's ~1800 icon entries — the
+# zip is 3.0 MB compressed / 19 MB decompressed. That is the realistic upper end for an app
+# of this shape, and it is an order of magnitude inside both caps.
+#
+# Note it is LARGER than a CDN-sourced bundle, deliberately: the CDN evaluates NODE_ENV and
+# keeps one branch, while a static build cannot know which the runtime will take, so both
+# are carried. Over-inclusion costs bytes; under-inclusion costs a blocking third-party
+# fetch at boot for the missing file. An oversize zip is also a graceful degradation rather
+# than a break — the runtime aborts and falls through to the REST API — so the cost of being
+# wrong here is a slow boot, not a broken one.
+#
+# Pages is auto-provisioned by the `actions/configure-pages` step below
+# (enablement: true), so no manual Settings → Pages step is needed on a fresh repo.
+#
+# Self-provisioning needs a token that may CREATE the Pages site: the default
+# workflow `GITHUB_TOKEN` cannot (the enablement API answers "Resource not
+# accessible by integration" on a brand-new repo). The step below mints a
+# short-lived token from the org's **deploy GitHub App** (the same App the
+# `deploy` repo uses) via `actions/create-github-app-token`, then hands it to
+# `configure-pages`. Requirements (one-time, org owner):
+#   - the deploy App has **Pages: write** + **Administration: write** repo
+#     permissions and is installed on this repo (org-wide install is simplest);
+#   - its `DEPLOY_APP_ID` + `DEPLOY_APP_PRIVATE_KEY` are **organization secrets**
+#     scoped to ALL repositories in the org, so a repo created a minute ago can
+#     read them (they were scoped to "selected repositories" until R3-410; every
+#     fresh repo failed its first two runs until an owner widened them).
+# When those secrets are absent — a fork, or any repo outside the org — the mint
+# step is skipped, the step falls back to `GITHUB_TOKEN`, and on a repo without
+# Pages it fails with "Create Pages site failed: Resource not accessible by
+# integration". Fix: enable Pages once by hand (`gh api -X POST
+# repos/<owner>/<repo>/pages -f build_type=workflow`, or Settings → Pages →
+# Source: GitHub Actions) and re-run. Repos with Pages already on are unaffected.
+# See ZIP_CACHE_AUTOMATION_SPEC §8.
+
+name: Cache for immediately.run
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Allow this workflow to publish to GitHub Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two Pages deploys at once; let an in-progress one finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions are pinned by commit SHA, and the CLI by an exact
+      # version — this workflow holds `pages: write`, so a floating tag
+      # (`@latest`, `@v4`) would let an upstream compromise poison the cache a
+      # repo serves to immediately.run (ZIP_CACHE_AUTOMATION_SPEC §8). Bump
+      # these deliberately when you mean to.
+      # R3-897: full history — the build loop below checks out KEPT (older) refs
+      # to build their zips from their own trees, which a depth-1 clone cannot
+      # reach.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      # Mint a short-lived token from the org's deploy GitHub App, scoped (by
+      # default) to THIS repo only — used solely to enable Pages on a fresh repo.
+      # Skipped when the App secrets aren't set, so the step below falls back to
+      # GITHUB_TOKEN. The token is an output consumed only by configure-pages; the
+      # cache-zip build never sees it.
+      # `secrets` cannot be referenced in a step `if:` (GitHub rejects the
+      # workflow at parse time — "Unrecognized named-value: 'secrets'"). Surface
+      # the App credentials through `env` first, then gate on `env`, which IS
+      # allowed — and read them back out of `env` in `with:` too. Spelling a
+      # secret name twice is how the gate and the action drift apart: rename one
+      # and the gate evaluates false forever while the action still gets a value.
+      #
+      # GATE ON BOTH SECRETS, not just the id. They are a PAIR, and the mint
+      # needs both. With only the id checked, a repo that has `DEPLOY_APP_ID`
+      # set and `DEPLOY_APP_PRIVATE_KEY` unset passes this gate and hands
+      # create-github-app-token an empty private key. One credential of a pair
+      # present is exactly the half-configured case a guard exists for.
+      #
+      # `continue-on-error` covers what the gate CANNOT see: a malformed key, a
+      # rotated keypair, or the App not installed on this repo. All three pass
+      # the conjunction and still fail the mint — and a failed mint without
+      # `continue-on-error` kills the whole `build` job before `cache-zip` runs,
+      # so the repo publishes NO zip at all instead of falling back to
+      # GITHUB_TOKEN as the comment above and the `configure-pages` comment
+      # below both promise. With it, the step's empty `token` output falls
+      # through to `github.token` on its own.
+      #
+      # What that rescues, precisely: a repo that ALREADY has Pages enabled. On
+      # a repo that does not, `configure-pages` with `enablement: true` and only
+      # GITHUB_TOKEN fails "Resource not accessible by integration" (the header
+      # comment above) and `build` dies one step later instead. Enabling Pages
+      # on a fresh repo genuinely needs the App; this only stops a broken App
+      # from costing the zip as well.
+      - name: Mint Pages-enablement token
+        id: pages-token
+        env:
+          DEPLOY_APP_ID: ${{ secrets.DEPLOY_APP_ID }}
+          DEPLOY_APP_PRIVATE_KEY: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
+        if: ${{ env.DEPLOY_APP_ID != '' && env.DEPLOY_APP_PRIVATE_KEY != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ env.DEPLOY_APP_ID }}
+          private-key: ${{ env.DEPLOY_APP_PRIVATE_KEY }}
+
+      # A half-wired App is BROKEN, not unconfigured — say so out loud. The gate
+      # above and `continue-on-error` together turn every broken case into a
+      # silent skip, and the only symptom left is a repo that quietly never gets
+      # Pages enabled. Warn when exactly one credential is set, or when both are
+      # set and the mint produced no token anyway. A warning, not a failure: a
+      # repo with neither secret is legitimate (a fork, anything outside the org)
+      # and must stay quiet.
+      - name: Warn on a half-wired deploy App
+        env:
+          DEPLOY_APP_ID: ${{ secrets.DEPLOY_APP_ID }}
+          DEPLOY_APP_PRIVATE_KEY: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
+        if: >-
+          ${{ (env.DEPLOY_APP_ID != '' && env.DEPLOY_APP_PRIVATE_KEY == '')
+          || (env.DEPLOY_APP_ID == '' && env.DEPLOY_APP_PRIVATE_KEY != '')
+          || (env.DEPLOY_APP_ID != '' && env.DEPLOY_APP_PRIVATE_KEY != ''
+          && steps.pages-token.outputs.token == '') }}
+        run: |
+          echo "::warning title=Deploy App half-wired::DEPLOY_APP_ID and DEPLOY_APP_PRIVATE_KEY must BOTH be set, and the App must be installed on this repo with a current keypair. Pages auto-enablement is being skipped. If Pages is not already enabled here, configure-pages will fail on the next step."
+
+      # Auto-provision GitHub Pages so the deploy job can publish even on a
+      # freshly-created repo. Without this, `deploy-pages` 404s every run until
+      # someone manually flips Settings → Pages → Source: GitHub Actions.
+      #
+      # `token`: enabling Pages on a fresh repo needs more than the workflow
+      # GITHUB_TOKEN carries — use the deploy-App token minted above when present,
+      # else fall back to GITHUB_TOKEN so repos that already have Pages enabled
+      # keep working unchanged.
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+        with:
+          enablement: true
+          token: ${{ steps.pages-token.outputs.token || github.token }}
+
+      # Install this repo's dependencies BEFORE caching (R3-567).
+      #
+      # WHY. `cache-zip` resolves the dependency lockset — and, with --bundle-packages,
+      # the module content — from the sandpack dependency CDN. That CDN's npm mirror lags
+      # a fresh publish by hours, and on 2026-09-08 that kept immediately.run's front door
+      # blank long after the bug had been fixed and released: the cached zip, the one
+      # artifact that should have covered the outage, was itself built by asking the
+      # service that was failing. `cache-zip` now fills the CDN's gaps from `node_modules`
+      # — but only if there IS one.
+      #
+      # NON-FATAL, and conditional on a lockfile. A repo with no package-lock.json, or one
+      # whose install fails, must keep caching exactly as before: cache-zip falls back to
+      # the CDN on its own, so the worst case here is today's behaviour, not a broken
+      # build. `npm ci --ignore-scripts` because this step exists to populate a directory,
+      # not to run a package's arbitrary postinstall on a runner holding `pages: write`.
+      - name: Install dependencies (for the lockset; optional)
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --ignore-scripts --no-audit --no-fund || \
+              echo "::warning::npm ci failed; cache-zip will fall back to the package CDN"
+          else
+            echo "no package-lock.json — skipping install; cache-zip will use the package CDN"
+          fi
+
+      # Two keys for the same build: the branch name (what apps booted by branch
+      # probe) and the pushing commit's sha (what a commit-pinned library mount
+      # probes — site-main COW.ts mountGitHubRepository -> cachedZipUrl uses the
+      # pin verbatim, and libraryFreshness.ts serves a commit pin cache/REST-first;
+      # LIBRARY_MOUNTS_SPEC §7 recommends commit pins). A branch-keyed zip alone
+      # leaves every sha-pinned mount on the anonymous-REST fallback (found on
+      # R3-624: file-selector's pinned sha 404s while its main.zip is 200).
+      #
+      # BOUND, by design until R3-897: each deploy REPLACES the Pages site, so a sha
+      # zip served only while its commit was the branch head — a consumer's pinned
+      # sha was evicted by the library's next push and its mount fell back to REST
+      # (correct, slower) until the consumer re-pinned. R3-897 keeps every
+      # consumer-pinned sha resident across redeploys: the keep-set step below
+      # re-builds them each run, derived from the consumers' package.json pins.
+      - name: Derive the consumer-pinned refs to keep (R3-897)
+        id: kept
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEPT_OWNER: ${{ github.repository_owner }}
+          KEPT_REPO: ${{ github.event.repository.name }}
+        run: |
+          # KEPT-ZIP-REFS-BEGIN (R3-897) — new-project-template's
+          # scripts/check-kept-zip-refs.mjs extracts and drives this block. Edit the
+          # TEMPLATE's copy (this file is replicated by value; a local edit of a
+          # consumer's copy is drift the nightly check reports), then re-sync.
+          node <<'KEPT_ZIP_REFS' >> "$GITHUB_OUTPUT"
+          const { execFileSync } = require('node:child_process');
+          const owner = process.env.KEPT_OWNER;
+          const repo = process.env.KEPT_REPO;
+          const gh = (...a) => execFileSync('gh', ['api', ...a], { encoding: 'utf8', maxBuffer: 1 << 24 });
+          // Paginated, like the drift check's own listing: past 100 org repos a
+          // single page would silently truncate the keep-set. `--paginate` prints
+          // one JSON array per page, so project to names and split — the same
+          // shape the drift check uses for the same listing. `/users/<owner>/repos`
+          // (NOT `/orgs/`, which 404s for a USER-owned owner — a fork or a user repo
+          // adopting this template would lose its cache on every push): it answers
+          // 200 for both org- and user-owned owners.
+          const names = gh(`/users/${owner}/repos?per_page=100`, '--paginate', '--jq', '.[].name')
+            .split('\n').map((l) => l.trim()).filter(Boolean);
+          const kept = new Set();
+          // GitHub resolves owner/repo names case-insensitively and git resolves
+          // UPPERCASE hex, so a functioning pin spelled with non-canonical casing —
+          // the owner/repo half OR the sha half — must still be kept. The sha stays
+          // VERBATIM (never lowercased): the client probes the pin verbatim, so a
+          // lowercased publish would 404.
+          const pinPrefix = `github:${owner}/${repo}#`.toLowerCase();
+          for (const name of names) {
+            if (name === repo) continue; // this repo's own head is built separately
+            let pkg;
+            try {
+              pkg = gh(`/repos/${owner}/${name}/contents/package.json`, '-H', 'Accept: application/vnd.github.raw');
+            } catch (e) {
+              const msg = String((e && e.stderr) || e);
+              // Benign only: no package.json (404), or a repo this token cannot read
+              // (a plain permission 403 — e.g. a private consumer). EVERYTHING ELSE
+              // — a 5xx, a DNS failure, and RATE LIMITS, which GitHub answers as
+              // 403s ("API rate limit exceeded" / "secondary rate limit") —
+              // RETHROWS and fails the run, fail-closed: the previous Pages site
+              // (its zips included) stays, and a dropped pin is never silent (the
+              // exact eviction this keep-set exists to stop). The scan makes ~2
+              // rapid gh calls per org repo, exactly the burst secondary limits
+              // target, so a rate limit is a realistic mid-run event, not a
+              // theoretical one.
+              if (/HTTP 404/.test(msg)) continue;
+              if (/HTTP 403/.test(msg) && !/rate limit/i.test(msg)) continue;
+              throw e;
+            }
+            // Walk the parsed dependency values, never a regex over raw text: a
+            // full-40-hex sha pin in ANY dependency group (dependencies,
+            // devDependencies, peerDependencies, optionalDependencies) stays
+            // keepable. Non-sha pins (a tag, a short sha) are npm-accepted but
+            // NOT kept — the 40-hex check is the injection guard for the unquoted
+            // refs expansion below.
+            let parsed;
+            try {
+              parsed = JSON.parse(pkg);
+            } catch (e) {
+              throw new Error(`${owner}/${name}: unparseable package.json — ${e && e.message}`);
+            }
+            for (const group of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+              const deps = parsed[group];
+              if (!deps) continue;
+              for (const spec of Object.values(deps)) {
+                if (typeof spec === 'string' && spec.toLowerCase().startsWith(pinPrefix) && /^[0-9a-fA-F]{40}$/.test(spec.slice(pinPrefix.length))) {
+                  kept.add(spec.slice(pinPrefix.length));
+                }
+              }
+            }
+          }
+          console.log('refs=' + [...kept].join(' '));
+          KEPT_ZIP_REFS
+          # KEPT-ZIP-REFS-END
+        # The private/repo-scoped GITHUB_TOKEN cannot read other PRIVATE repos'
+        # package.json — the two known consumers (landing-page, home) are public, and
+        # a private consumer's pin is kept the first run after it makes its pin
+        # readable to this token (or re-pins after a redeploy). Public pins cover the
+        # case that shipped: a first-party library every front-door load mounts.
+
+      - name: Build cache zip
+        run: |
+          # R3-897: `cache-zip` archives the tracked tree at HEAD and the workflow's
+          # checkout is depth-1 — so building a KEPT (older) ref's zip requires the
+          # full history (fetch-depth: 0 above) and a `git checkout` of the ref, or
+          # the "rebuilt" zip would carry the new head's tree with a mismatched
+          # sidecar commitSha — a zip the consumer's integrity check REJECTS, which
+          # is worse than the eviction (a poisoned probe plus a spurious integrity
+          # event on every cold boot). The branch name and the pushing sha need no
+          # checkout (they ARE HEAD at run time).
+          for ref in "${{ github.ref_name }}" "${{ github.sha }}" ${{ steps.kept.outputs.refs }}; do
+            [ -n "$ref" ] || continue
+            if [ "$ref" != "${{ github.ref_name }}" ] && [ "$ref" != "${{ github.sha }}" ]; then
+              git checkout --force --quiet "$ref"
+            fi
+            npx -y @immediately-run/cli@0.9.1 cache-zip \
+              --owner "${{ github.repository_owner }}" \
+              --repo "${{ github.event.repository.name }}" \
+              --ref "$ref" \
+              --default-branch "${{ github.event.repository.default_branch }}" \
+              --bundle-packages \
+              --out "_site/cached_repositories/$ref.zip"
+          done
+
+      # A friendly landing page so the Pages root isn't a bare 404. Optional —
+      # delete it if you serve your own content from Pages. (To also host a live
+      # build of the app here, run `npm ci && npm run build` and copy `dist/`
+      # into `_site/`; set Vite `base: './'` so asset paths resolve.)
+      - name: Write index.html
+        run: |
+          cat > _site/index.html <<'HTML'
+          <!doctype html><meta charset="utf-8">
+          <title>immediately.run cache</title>
+          <p>This site hosts a pre-cached build of this repository for
+          <a href="https://immediately.run">immediately.run</a>.</p>
+          HTML
+
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

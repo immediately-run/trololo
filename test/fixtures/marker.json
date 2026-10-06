@@ -1,0 +1,24 @@
+{
+  "kind": "board",
+  "opensWith": { "app": "github:immediately-run/trololo" },
+  "layout": {
+    "version": 2,
+    "recordSets": {
+      "board":   { "match": "board.json", "mergeType": "register",
+                   "fields": { "name": "string:1..200" } },
+      "columns": { "match": "columns/*.json", "id": "filename", "mergeType": "register",
+                   "fields": { "name": "string:1..200", "order": "fracKey", "archived": "boolean",
+                               "deleted": "boolean" } },
+      "cards":   { "match": "cards/*.json", "id": "filename", "mergeType": "register",
+                   "fields": { "title": "string:1..500", "column": "id", "order": "fracKey",
+                               "labels": "map<labelName,true>", "due": "date|null",
+                               "archived": "boolean", "deleted": "boolean",
+                               "created": "timestamp", "createdBy": "login" },
+                   "groups": { "position": ["column", "order"] },
+                   "maps": ["labels"],
+                   "immutable": ["created", "createdBy"] },
+      "descriptions": { "match": "cards/*.md", "id": "filename", "mergeType": "turn-taking",
+                        "mediaType": "text/markdown", "maxBytes": 65536 }
+    }
+  }
+}
