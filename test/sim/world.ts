@@ -403,7 +403,7 @@ export class World {
    * For coverage: the read-set groups, and how many groups of two or more replicas hold an
    * implied-freeze input (a second version, or a ceiling version) in what they read.
    */
-  sameSetStats(): { groups: number; impliedPairs: number; orderSplits: number } {
+  sameSetStats(): { groups: number; impliedPairs: number; orderSplits: number; combinedReaders: number; twoCeilingReaders: number } {
     const groups = new Map<string, Replica[]>();
     for (const r of this.replicas) {
       const k = `${this.readSet(r)}\n@${r.syncedHead}`;
@@ -416,6 +416,16 @@ export class World {
         return false;
       }
     };
+    // Per replica: what it read holds a ceiling version AND a second version (P1/P3), or two
+    // ceiling versions of one slot (P2).
+    const readsOf = (r: Replica) => [...[...r.seen].map(([p, b]) => ({ path: p, bytes: b })), ...r.extra];
+    let combinedReaders = 0;
+    let twoCeilingReaders = 0;
+    for (const r of this.replicas) {
+      const reads = readsOf(r);
+      if (r.extra.length > 0 && reads.some((x) => ceiling(x.bytes))) combinedReaders++;
+      if (r.extra.some((x) => ceiling(x.bytes) && ceiling(r.seen.get(x.path) ?? new Uint8Array()))) twoCeilingReaders++;
+    }
     let impliedPairs = 0;
     let orderSplits = 0;
     for (const [, rs] of groups) {
@@ -425,7 +435,7 @@ export class World {
       // The same versions read, but a slot kept in a different version (read in another order).
       if (rs.some((o) => [...o.seen].some(([p, b]) => !sameBytes(b, r.seen.get(p) ?? new Uint8Array())))) orderSplits++;
     }
-    return { groups: groups.size, impliedPairs, orderSplits };
+    return { groups: groups.size, impliedPairs, orderSplits, combinedReaders, twoCeilingReaders };
   }
 
   /**
@@ -507,14 +517,20 @@ export class World {
    */
   async plantSecondVersion(): Promise<void> {
     const paths = [...this.space.keys()].filter((p) => p.startsWith('batches/'));
-    const path = this.pick(paths);
+    const bodyOf = (p: string) => JSON.parse(new TextDecoder().decode(this.space.get(p)!)) as BatchBody;
+    // Mostly, when the space stores a ceiling batch, a second version OF it (P2's shape:
+    // two ceiling versions of one slot, on another base).
+    const ceilings = paths.filter((p) => bodyOf(p)?.lamport === LAMPORT_LIMIT - 1);
+    const path = ceilings.length && this.rng() < 0.85 ? this.pick(ceilings) : this.pick(paths);
     if (!path) return;
-    const body = JSON.parse(new TextDecoder().decode(this.space.get(path)!)) as BatchBody;
+    const body = bodyOf(path);
     if (!body || !Array.isArray(body.ops)) return;
     this.secondVersions++;
+    const chain = this.firstParentChain(this.git.main);
     const alt: BatchBody = {
       ...body,
-      lamport: this.rng() < 0.5 ? LAMPORT_LIMIT - 1 : body.lamport,
+      lamport: body.lamport === LAMPORT_LIMIT - 1 || this.rng() < 0.5 ? LAMPORT_LIMIT - 1 : body.lamport,
+      base: body.lamport === LAMPORT_LIMIT - 1 ? this.pick(chain)!.sha : body.base,
       ops: [{ path: `cards/${CARDS[this.int(CARDS.length)]}.json`, group: 'title', value: `Second ${this.int(99)}` }],
     };
     await this.serve(path, encodeBatch(alt), this.rng() < 0.2);

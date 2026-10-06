@@ -42,6 +42,7 @@ interface Coverage {
   sameSetImpliedPairs: number;
   orderSplitRuns: number;
   lateJoinRuns: number;
+  twoCeilingRuns: number;
 }
 
 /** The `at` of a freeze that stops the chain, as some replica holds it: what a second rewrite removes. */
@@ -99,7 +100,7 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
       else await w.plantSecondVersion();
       // Now and then a replica joins after the plant: it reads the space only.
       if (w.rng() < 0.3 && w.replicas.length < 6) {
-        await w.join(['fay', 'gus', 'hal'][w.int(3)]);
+        rs.push(await w.join(['fay', 'gus', 'hal'][w.int(3)])); // and it acts from now on
         joined = true;
       }
     }
@@ -135,7 +136,8 @@ async function run(seed: number, replicas: number, actions: number[], cov?: Cove
     if (sets.impliedPairs > 0) cov.sameSetImpliedPairs++;
     if (sets.orderSplits > 0) cov.orderSplitRuns++;
     if (joined) cov.lateJoinRuns++;
-    if (w.ceilingPlants + w.secondVersions >= 2 && w.ceilingPlants > 0 && w.secondVersions > 0) cov.combinedRuns++;
+    if (sets.combinedReaders > 0) cov.combinedRuns++;
+    if (sets.twoCeilingReaders > 0) cov.twoCeilingRuns++;
   }
   return w;
 }
@@ -146,7 +148,7 @@ describe('convergence', () => {
   });
 
   it(`random sessions converge to the oracle (${RUNS} runs)`, async () => {
-    const cov: Coverage = { publishes: 0, conflicts: 0, merges: 0, reloads: 0, supersededRuns: 0, unfrozenRuns: 0, frozenRuns: 0, twoFreezeRuns: 0, twoRewriteRuns: 0, stopOffChainRuns: 0, mixedBatches: 0, ceilingRuns: 0, secondVersionRuns: 0, splitRuns: 0, sameSetGroupsSplit: 0, combinedRuns: 0, sameSetImpliedPairs: 0, orderSplitRuns: 0, lateJoinRuns: 0 };
+    const cov: Coverage = { publishes: 0, conflicts: 0, merges: 0, reloads: 0, supersededRuns: 0, unfrozenRuns: 0, frozenRuns: 0, twoFreezeRuns: 0, twoRewriteRuns: 0, stopOffChainRuns: 0, mixedBatches: 0, ceilingRuns: 0, secondVersionRuns: 0, splitRuns: 0, sameSetGroupsSplit: 0, combinedRuns: 0, sameSetImpliedPairs: 0, orderSplitRuns: 0, lateJoinRuns: 0, twoCeilingRuns: 0 };
     await fc.assert(
       fc.asyncProperty(
         fc.integer({ min: 1, max: 2 ** 31 - 1 }),
@@ -183,8 +185,10 @@ describe('convergence', () => {
     // A run where two or more replicas read the same versions AND those versions hold an implied-
     // freeze input — the pairs the same-set assertion is about.
     expect(cov.sameSetImpliedPairs).toBeGreaterThan(RUNS / 50);
-    // A ceiling batch and a second version in one run (the P1/P3 shapes).
+    // A replica that read a ceiling version and a second version (the P1/P3 shapes), and one that
+    // read two ceiling versions of one slot (P2).
     expect(cov.combinedRuns).toBeGreaterThan(RUNS / 250);
+    expect(cov.twoCeilingRuns).toBeGreaterThan(0);
     // Round 1's shape: two replicas read the same versions but keep different ones of a slot.
     expect(cov.orderSplitRuns).toBeGreaterThan(RUNS / 250);
     // A replica that joins after a plant, reading the space only.
