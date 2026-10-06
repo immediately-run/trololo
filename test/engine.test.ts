@@ -2,10 +2,10 @@
 
 import { describe, expect, it } from 'vitest';
 import { batchPath, encodeBatch, LAMPORT_LIMIT, type BatchBody } from '../src/lib/session/batch';
-import { bootstrapFiles, FrozenError, LamportExhausted, NotReadyError, SessionEngine } from '../src/lib/session/engine';
+import { bootstrapFiles, LamportExhausted, NotReadyError, SessionEngine } from '../src/lib/session/engine';
 import { layoutFromMarker } from '../src/lib/session/layout';
 import { outsideEdit, place, sendTo, settle, titleOf } from './sim/helpers';
-import { CARDS, COLUMNS, hash, LAYOUT, MARKER, SESSION_ID, World, type Replica } from './sim/world';
+import { CARDS, COLUMNS, hash, LAYOUT, MARKER, SESSION_ID, World } from './sim/world';
 
 const [X, Y] = CARDS;
 const decode = (b: Uint8Array) => JSON.parse(new TextDecoder().decode(b)) as BatchBody;
@@ -188,7 +188,7 @@ describe('review regressions (PR #1)', () => {
     expect(a.engine.pending().map((p) => p.group).sort()).toEqual(['created', 'createdBy', 'position', 'title']);
   });
 
-  it('refuses to issue once the lamport space is exhausted, and the exhausted log freezes the reader (§15.5)', async () => {
+  it('refuses to issue once the lamport space is exhausted, with the typed LamportExhausted (§15.5; the exhausted-log freeze itself is OPEN, R3-995)', async () => {
     const w = new World(316);
     const a = await w.join('ana');
     const b = await w.join('ben');
@@ -196,32 +196,13 @@ describe('review regressions (PR #1)', () => {
     const top = encodeBatch({ ...one, lamport: LAMPORT_LIMIT - 1 });
     // Ben reads a batch at the top of the lamport range (here, a rewritten copy of Ana's first).
     await w.receiveNow(b, batchPath(one.actor, 1), top);
-    expect(b.engine.frozen()).toEqual({ reason: 'integrity', at: one.base });
-    await expect(b.engine.renameCard(X, 'y')).rejects.toBeInstanceOf(FrozenError);
+    // No freeze is implied from a ceiling read (the rule is open) — but no batch can be issued.
+    expect(b.engine.frozen()).toBeNull();
+    await expect(b.engine.renameCard(X, 'y')).rejects.toBeInstanceOf(LamportExhausted);
     await expect(b.engine.setTerms('no lamport left')).rejects.toBeInstanceOf(LamportExhausted);
     w.check(b);
   });
 });
-
-/** A well-formed batch of a forger's at the lamport ceiling, based on `base` (§15.5, an exhausted log). */
-function exhausting(base: string, name = 'top'): { path: string; bytes: Uint8Array } {
-  const actor = 'mal.aaaaaaaa.bbbbbbbb';
-  const body: BatchBody = {
-    v: 1, actor, seq: 1, lamport: LAMPORT_LIMIT - 1, base, prev: '', time: '2026-10-06T00:00:00Z',
-    ops: [{ path: '_session/terms', group: '$value', value: { name } }],
-  };
-  return { path: batchPath(actor, 1), bytes: encodeBatch(body) };
-}
-
-/** One version of a forger's batch slot, at `lamport`, based on `base`. */
-function forgedVersion(base: string, lamport: number, name: string): { path: string; bytes: Uint8Array } {
-  const actor = 'mal.aaaaaaaa.cccccccc';
-  const body: BatchBody = {
-    v: 1, actor, seq: 1, lamport, base, prev: '', time: '2026-10-06T00:00:00Z',
-    ops: [{ path: '_session/terms', group: '$value', value: { name } }],
-  };
-  return { path: batchPath(actor, 1), bytes: encodeBatch(body) };
-}
 
 describe('review regressions, round two (PR #2, kept by R3-992)', () => {
   it('restart re-applies an unpublished new card as a valid create batch', async () => {
@@ -257,7 +238,7 @@ describe('review regressions, round two (PR #2, kept by R3-992)', () => {
   });
 });
 
-describe('R3-992: the freeze stop and the exhausted log (§15.5)', () => {
+describe('R3-992: the freeze stop (§15.5 — the stop; the exhausted-log rule is OPEN, R3-995)', () => {
   /** Ana adopts x1 and x2 while Ben is offline; a force-push drops x2 (Ana freezes at x1); a second drops x1. */
   async function twoRewrites(seed: number) {
     const w = new World(seed);
@@ -330,103 +311,11 @@ describe('R3-992: the freeze stop and the exhausted log (§15.5)', () => {
     w.check(a);
   });
 
-  it('a lamport-exhausted replica is not lifted by a peer’s later layout freeze, and its offered chain is cut at the stop', async () => {
-    const w = new World(344);
-    const a = await w.join('ana');
-    const b = await w.join('ben');
-    await a.engine.renameCard(X, 'Kept pending');
-    await settle(w);
-    const root = w.git.main;
-    outsideEdit(w, `cards/${Y}.json`, { title: 'outside' });
-    await w.sync(b);
-    expect(b.engine.adoptedChain()).toHaveLength(2);
-    w.layoutChange();
-    await w.sync(a);
-    expect(a.engine.frozen()?.reason).toBe('layout'); // written, not yet delivered to Ben
-    const top = exhausting(root);
-    w.plant(top.path, top.bytes);
-    await w.receiveNow(b, top.path);
-    expect(b.engine.frozen()).toEqual({ reason: 'integrity', at: root });
-    expect(b.engine.adoptedChain()).toEqual([root]);
-    expect(b.engine.offeredChain().map((c) => c.sha)).toEqual([root]);
-    w.check(b);
-    await sendTo(w, a, b); // Ana's layout freeze reaches Ben
-    expect(b.engine.frozen()).toEqual({ reason: 'integrity', at: root });
-    w.check(b);
-    await settle(w);
-    for (const r of [a, b]) {
-      expect(r.engine.frozen()).toEqual({ reason: 'integrity', at: root });
-      expect(r.engine.adoptedChain()).toEqual([root]);
-    }
-  });
 
-  it('an exhausted replica that detects another integrity failure writes nothing and does not throw', async () => {
-    const w = new World(345);
-    const b = await w.join('ben');
-    const top = exhausting(w.root);
-    w.plant(top.path, top.bytes);
-    await w.receiveNow(b, top.path);
-    // A second version of the same slot: an integrity failure Ben has no lamport left to announce.
-    await expect(w.receiveNow(b, top.path, exhausting(w.root, 'other').bytes)).resolves.toBeUndefined();
-    expect(b.engine.takeOutbox()).toEqual([]);
-    expect(b.engine.frozen()).toEqual({ reason: 'integrity', at: w.root });
-    w.check(b);
-  });
 
-  /** Two versions of one forged slot; `v2` sits at the ceiling (the round-one repro on trololo#3). */
-  async function twoVersions(seed: number) {
-    const w = new World(seed);
-    const a = await w.join('ana');
-    const b = await w.join('ben');
-    const root = w.git.main;
-    const x1 = outsideEdit(w, `cards/${X}.json`, { title: 'x1' });
-    await w.sync(a);
-    await w.sync(b);
-    expect(a.engine.adoptedChain()).toEqual([root, x1]);
-    const v1 = forgedVersion(root, 50, 'one');
-    const v2 = forgedVersion(root, LAMPORT_LIMIT - 1, 'two');
-    return { w, a, b, root, x1, v1, v2 };
-  }
 
-  it('two versions of a slot, one at the ceiling: the replica that read the lower one first freezes like the one that read the ceiling', async () => {
-    const { w, a, b, root, v1, v2 } = await twoVersions(347);
-    await w.receiveNow(a, v1.path, v1.bytes);
-    await w.receiveNow(b, v2.path, v2.bytes);
-    await w.receiveNow(a, v2.path, v2.bytes); // Ana detects the conflict and has no lamport left to announce it
-    await sendTo(w, a, b);
-    w.check(a);
-    w.check(b);
-    expect(a.engine.frozen()).toEqual({ reason: 'integrity', at: root });
-    expect(b.engine.frozen()).toEqual(a.engine.frozen());
-    expect(b.engine.adoptedChain()).toEqual(a.engine.adoptedChain());
-    expect(a.engine.adoptedChain()).toEqual([root]);
-  });
 
-  it('two versions of a slot, one at the ceiling: the same freeze whichever version each replica reads first', async () => {
-    const { w, a, b, v1, v2 } = await twoVersions(348);
-    await w.receiveNow(a, v1.path, v1.bytes);
-    await w.receiveNow(b, v2.path, v2.bytes);
-    await w.receiveNow(a, v2.path, v2.bytes);
-    await w.receiveNow(b, v1.path, v1.bytes);
-    w.check(a);
-    w.check(b);
-    expect(b.engine.frozen()).toEqual(a.engine.frozen());
-    expect(b.engine.adoptedChain()).toEqual(a.engine.adoptedChain());
-  });
 
-  it('two ceiling versions of one slot tie in §3.8 order: the greater at wins in either reading order', async () => {
-    const { w, a, b, root, x1, v2 } = await twoVersions(350);
-    const other = forgedVersion(x1, LAMPORT_LIMIT - 1, 'six');
-    await w.receiveNow(a, v2.path, v2.bytes);
-    await w.receiveNow(a, other.path, other.bytes);
-    await w.receiveNow(b, other.path, other.bytes);
-    await w.receiveNow(b, v2.path, v2.bytes);
-    w.check(a);
-    w.check(b);
-    const greater = root > x1 ? root : x1;
-    for (const r of [a, b]) expect(r.engine.frozen()).toEqual({ reason: 'integrity', at: greater });
-    expect(b.engine.adoptedChain()).toEqual(a.engine.adoptedChain());
-  });
 
   it('a forged freeze whose at names no commit stops at the start base, and a port that refuses the question does not wedge the replica', async () => {
     const w = new World(349);
@@ -452,76 +341,9 @@ describe('R3-992: the freeze stop and the exhausted log (§15.5)', () => {
     w.check(a);
   });
 
-  /**
-   * After a ceiling conflict: Carl joins, Ana reloads. Every replica — those that read the ceiling
-   * version, and those that read only the space — must hold the same freeze and chain.
-   */
-  async function joinAndReload(w: World, rs: Replica[]): Promise<Replica[]> {
-    for (const r of rs) {
-      w.write(r);
-      w.resolve(r);
-    }
-    const carl = await w.join('carl');
-    await w.reload(rs[0]);
-    const all = [...rs, carl];
-    const [first, ...rest] = all;
-    expect(first.engine.frozen()?.reason).toBe('integrity');
-    for (const r of rest) {
-      expect(r.engine.frozen()).toEqual(first.engine.frozen());
-      expect(r.engine.adoptedChain()).toEqual(first.engine.adoptedChain());
-    }
-    await expect(carl.engine.renameCard(X, 'Carl edits')).rejects.toBeInstanceOf(FrozenError);
-    await expect(rs[0].engine.renameCard(X, 'Ana edits after reload')).rejects.toBeInstanceOf(FrozenError);
-    for (const r of all) {
-      w.collect(r);
-      w.check(r);
-    }
-    await settle(w);
-    return all;
-  }
 
-  it('a ceiling version the space does not hold is announced: a joiner and a reloaded replica freeze like the rest', async () => {
-    const { w, a, b, root, v1, v2 } = await twoVersions(352);
-    w.plant(v1.path, v1.bytes); // the space holds the lower version
-    await w.receiveNow(a, v1.path, v1.bytes);
-    await w.receiveNow(b, v2.path, v2.bytes); // Ben is served the ceiling version
-    await w.receiveNow(a, v2.path, v2.bytes); // Ana kept the lower one, so she announces
-    expect(a.journal).toHaveLength(1);
-    expect(decode(a.journal[0].bytes)).toMatchObject({
-      lamport: LAMPORT_LIMIT - 1, base: root, ops: [{ path: '_session/frozen', value: { reason: 'integrity', at: root } }],
-    });
-    await sendTo(w, a, b);
-    for (const r of await joinAndReload(w, [a, b])) expect(r.engine.frozen()).toEqual({ reason: 'integrity', at: root });
-  });
 
-  it('a space that holds the ceiling version: the replica that kept the lower one announces, and every reader agrees', async () => {
-    const { w, a, b, root, v1, v2 } = await twoVersions(353);
-    w.plant(v2.path, v2.bytes); // the space holds the ceiling version
-    await w.receiveNow(a, v1.path, v1.bytes); // Ana is served the lower one first
-    await w.receiveNow(a, v2.path);
-    await w.receiveNow(b, v2.path);
-    expect(a.journal.map((o) => decode(o.bytes).lamport)).toEqual([LAMPORT_LIMIT - 1]);
-    for (const r of await joinAndReload(w, [a, b])) expect(r.engine.frozen()).toEqual({ reason: 'integrity', at: root });
-  });
 
-  it('the announcement is written even when a stop freeze is already in force', async () => {
-    const { w, a, b, root, x1, v1, v2 } = await twoVersions(354);
-    const forger = 'mal.aaaaaaaa.dddddddd';
-    const rewrite: BatchBody = {
-      v: 1, actor: forger, seq: 1, lamport: 3, base: root, prev: '', time: '2026-10-06T00:00:00Z',
-      ops: [{ path: '_session/frozen', group: '$value', value: { reason: 'rewrite', at: x1 } }],
-    };
-    w.plant(batchPath(forger, 1), encodeBatch(rewrite));
-    for (const r of [a, b]) await w.receiveNow(r, batchPath(forger, 1));
-    expect(a.engine.frozen()).toEqual({ reason: 'rewrite', at: x1 });
-    w.plant(v1.path, v1.bytes);
-    await w.receiveNow(a, v1.path);
-    await w.receiveNow(b, v2.path, v2.bytes);
-    await w.receiveNow(a, v2.path, v2.bytes);
-    expect(a.engine.frozen()).toEqual({ reason: 'integrity', at: root });
-    w.collect(a);
-    for (const r of await joinAndReload(w, [a, b])) expect(r.engine.frozen()).toEqual({ reason: 'integrity', at: root });
-  });
 
   it('a stop computed on a refused ancestry question is asked again by a poll of the same head', async () => {
     const w = new World(355);

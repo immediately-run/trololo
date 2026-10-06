@@ -360,12 +360,10 @@ export function oracle(input: OracleInput): OracleResult {
   };
   const holding = contiguousBy(() => true);
 
-  // Frozen (§15.5): every `_session/frozen` operation of a control-only batch that holds its slot,
-  // plus the freeze an exhausted log implies — any version read at lamport 2^48 − 1, a slot's losing
-  // version included, counts as carrying `{integrity, its base}` after its own operations. The
-  // winner: a freeze that stops the chain outranks a layout freeze; then §3.8 order; then the
-  // greater `at`. An announcement of an exhausted log (§15.5) is an ordinary control-only batch at the
-  // ceiling, so both rules above already cover it.
+  // Frozen (§15.5): every `_session/frozen` operation of a control-only batch that holds its slot.
+  // The winner: a freeze that stops the chain outranks a layout freeze; then §3.8 order; then the
+  // greater `at`. (The freeze an exhausted log implies is OPEN — §15.5 "An exhausted log", R3-995 —
+  // so the oracle, like the engine, knows written freezes only.)
   type FreezeCand = { lamport: number; actor: string; seq: number; index: number; value: { reason: string; at: string } };
   const cands: FreezeCand[] = [];
   for (const b of slots.values()) {
@@ -375,11 +373,6 @@ export function oracle(input: OracleInput): OracleResult {
       b.body.ops.forEach((op, index) => {
         if (op.path === '_session/frozen') cands.push({ ...at, index, value: op.value as FreezeCand['value'] });
       });
-    }
-  }
-  for (const b of versions) {
-    if (b.body && b.body.lamport === 2 ** 48 - 1) {
-      cands.push({ lamport: b.body.lamport, actor: b.actor, seq: b.seq, index: b.body.ops.length, value: { reason: 'integrity', at: b.body.base } });
     }
   }
   const beats = (x: FreezeCand, y: FreezeCand): boolean => {

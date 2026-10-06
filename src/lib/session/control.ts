@@ -1,8 +1,9 @@
 // The built-in control record set `_session/` (COLLABORATION_SESSIONS §15.5): terms and the
 // frozen state. Outside `Snap`, `C_B`, publish and §5.5; §3.8 last-write-wins, with the freeze
-// precedence rule and the freeze an exhausted log implies (§15.5).
+// precedence rule over the written freezes. (The freeze an exhausted log implies is OPEN — §15.5
+// "An exhausted log", R3-995 — so written freezes are the only freeze values here.)
 
-import { cmp, compareOrder, CONTROL_GROUP, type Op, type OpRef } from './batch';
+import { compareOrder, CONTROL_GROUP, type Op, type OpRef } from './batch';
 import type { Json } from './canonical';
 
 export type FreezeReason = 'layout' | 'rewrite' | 'integrity';
@@ -23,40 +24,18 @@ export interface ControlOp extends OpRef {
 
 export class ControlState {
   private readonly winners = new Map<string, ControlOp>();
-  /** The winning freeze implied by an exhausted log (§15.5), kept apart from the written ones. */
-  private implied: ControlOp | null = null;
 
   apply(op: ControlOp): void {
     const cur = this.winners.get(op.path);
     if (!cur || outranks(op, cur)) this.winners.set(op.path, op);
   }
 
-  /**
-   * A version of a batch file at the lamport ceiling has been read (§15.5, an exhausted log): it
-   * counts as carrying, after its own operations, an `integrity` freeze at its base. `ref` is the
-   * batch's own order key with `index` one past its last operation. Two versions of one slot can tie
-   * in §3.8 order; the greater `at` wins, so the result does not depend on which was read first.
-   */
-  applyExhausted(ref: OpRef, at: string): void {
-    const op: ControlOp = { ...ref, path: FROZEN_PATH, value: { reason: 'integrity', at } };
-    const cur = this.implied;
-    const c = cur ? compareOrder(op, cur) : 1;
-    if (c > 0 || (c === 0 && cmp(at, (cur!.value as { at: string }).at) > 0)) this.implied = op;
-  }
-
-  /** The winning freeze, written or implied, under the §15.5 precedence rule. */
+  /** The winning written freeze, under the §15.5 precedence rule. */
   frozen(): Frozen | null {
-    const written = this.winners.get(FROZEN_PATH);
-    const win = !written ? this.implied : !this.implied ? written : outranks(this.implied, written) ? this.implied : written;
-    return asFrozen(win);
+    return asFrozen(this.winners.get(FROZEN_PATH));
   }
 
-  /** The winning freeze an exhausted log implies, ignoring the written ones. */
-  impliedFrozen(): Frozen | null {
-    return asFrozen(this.implied);
-  }
-
-  /** The winning freeze written to the log, ignoring one an exhausted log implies. */
+  /** The winning freeze written to the log. */
   writtenFrozen(): Frozen | null {
     return asFrozen(this.winners.get(FROZEN_PATH));
   }
