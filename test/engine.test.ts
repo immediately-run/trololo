@@ -311,12 +311,6 @@ describe('R3-992: the freeze stop (§15.5 — the stop; the exhausted-log rule i
     w.check(a);
   });
 
-
-
-
-
-
-
   it('a forged freeze whose at names no commit stops at the start base, and a port that refuses the question does not wedge the replica', async () => {
     const w = new World(349);
     const a = await w.join('ana');
@@ -340,10 +334,6 @@ describe('R3-992: the freeze stop (§15.5 — the stop; the exhausted-log rule i
     expect(a.engine.adoptedChain()).toEqual([root]);
     w.check(a);
   });
-
-
-
-
 
   it('a stop computed on a refused ancestry question is asked again by a poll of the same head', async () => {
     const w = new World(355);

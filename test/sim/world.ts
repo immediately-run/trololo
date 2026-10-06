@@ -77,8 +77,6 @@ export class Replica {
    * head it last synced.
    */
   seen = new Map<string, Uint8Array>();
-  /** Later versions of a path that differ from the first one read (an integrity failure), in reading order. */
-  laterVersions: Array<{ path: string; bytes: Uint8Array }> = [];
   acked = new Set<string>();
   syncedHead = '';
 
@@ -168,18 +166,16 @@ export class World {
     r.unresolved = [];
     r.inbox = [];
     r.seen = fresh.seen;
-    r.laterVersions = fresh.laterVersions;
     r.acked = fresh.acked;
     r.syncedHead = fresh.syncedHead;
     this.reloads++;
   }
 
   see(r: Replica, path: string, bytes: Uint8Array, acked: boolean): void {
-    const first = r.seen.get(path);
-    if (!first) r.seen.set(path, bytes);
-    else if (!sameBytes(first, bytes) && !r.laterVersions.some((v) => v.path === path && sameBytes(v.bytes, bytes))) {
-      r.laterVersions.push({ path, bytes });
-    }
+    // First version read keeps the slot — the same reading the engine and the §15.6 rule make;
+    // later versions are the integrity failure the engine detects and freezes on (the freeze then
+    // reaches the oracle as a written `_session/frozen` op like any other).
+    if (!r.seen.has(path)) r.seen.set(path, bytes);
     if (acked) r.acked.add(path);
   }
 
@@ -273,7 +269,7 @@ export class World {
       sessionId: SESSION_ID,
       offered: this.chainFromStart(r.syncedHead),
       isAncestor: (a, d) => this.git.reaches(a, d),
-      batches: [...r.seen, ...r.laterVersions.map((v) => [v.path, v.bytes] as const)].map(([path, bytes]) => ({ path, bytes, acked: r.acked.has(path) })),
+      batches: [...r.seen].map(([path, bytes]) => ({ path, bytes, acked: r.acked.has(path) })),
     });
   }
 
@@ -544,10 +540,6 @@ export class World {
 }
 
 // ---- normalised comparison shapes -----------------------------------------------------------
-
-function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
-  return a.length === b.length && a.every((x, i) => x === b[i]);
-}
 
 export function vec(v: ReadonlyMap<string, number>): Record<string, number> {
   return Object.fromEntries([...v].sort(([a], [b]) => cmp(a, b)));

@@ -339,12 +339,10 @@ export function oracle(input: OracleInput): OracleResult {
   const { layout, sessionId, offered } = input;
 
   // Slots: one batch per (actor, seq); the replica keeps the first version it saw.
-  const versions: Batch[] = [];
   const slots = new Map<string, Batch>();
   for (const f of input.batches) {
     const b = readBatch(f.path, f.bytes, f.acked);
     if (!b) continue;
-    versions.push(b);
     if (!slots.has(b.key)) slots.set(b.key, b);
   }
 
@@ -361,9 +359,10 @@ export function oracle(input: OracleInput): OracleResult {
   const holding = contiguousBy(() => true);
 
   // Frozen (§15.5): every `_session/frozen` operation of a control-only batch that holds its slot.
-  // The winner: a freeze that stops the chain outranks a layout freeze; then §3.8 order; then the
-  // greater `at`. (The freeze an exhausted log implies is OPEN — §15.5 "An exhausted log", R3-995 —
-  // so the oracle, like the engine, knows written freezes only.)
+  // (The freeze an exhausted log implies is OPEN — §15.5 "An exhausted log", R3-995 — so the
+  // oracle, like the engine, knows written freezes only.)
+  // The winner: a freeze that stops the chain outranks a layout freeze; then §3.8 order (a full
+  // tie is impossible for written freezes: actor+seq name the slot, index the op).
   type FreezeCand = { lamport: number; actor: string; seq: number; index: number; value: { reason: string; at: string } };
   const cands: FreezeCand[] = [];
   for (const b of slots.values()) {
@@ -382,8 +381,7 @@ export function oracle(input: OracleInput): OracleResult {
     if (x.lamport !== y.lamport) return x.lamport > y.lamport;
     if (x.actor !== y.actor) return lt(y.actor, x.actor);
     if (x.seq !== y.seq) return x.seq > y.seq;
-    if (x.index !== y.index) return x.index > y.index;
-    return lt(y.value.at, x.value.at);
+    return x.index > y.index;
   };
   let frozenWin: FreezeCand | null = null;
   for (const c of cands) if (frozenWin === null || beats(c, frozenWin)) frozenWin = c;

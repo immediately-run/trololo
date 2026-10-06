@@ -35,7 +35,9 @@ export class ControlState {
     return asFrozen(this.winners.get(FROZEN_PATH));
   }
 
-  /** The winning freeze written to the log. */
+  /** The winning freeze written to the log. Identical to `frozen()` while the implied-freeze
+   *  rule is OPEN (§15.5, R3-995) — kept as the call site the engine's idempotence guard names,
+   *  so R3-995's written/implied split has its seam back. */
   writtenFrozen(): Frozen | null {
     return asFrozen(this.winners.get(FROZEN_PATH));
   }

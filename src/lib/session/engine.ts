@@ -85,7 +85,7 @@ export interface PublishPlan {
 
 export class FrozenError extends Error {}
 export class NotReadyError extends Error {}
-/** This replica keeps a batch at the §3.8 lamport ceiling, so no further batch can be issued (§15.5, an exhausted log). */
+/** This replica keeps a batch at the lamport ceiling of §3.8's [0, 2^48) range, so no further batch can be issued. */
 export class LamportExhausted extends Error {
   constructor() {
     super('the lamport space is exhausted; restart the session');
@@ -575,7 +575,10 @@ export class SessionEngine {
     if (!seqs) this.slots.set(r.actor, (seqs = new Map()));
     seqs.set(r.seq, r);
     if (acked) this.acked.add(r.key);
-    // Only the version that keeps the slot spends lamport space (§15.5): a losing one never raises ours.
+    // Lamport accounting: a losing version never raises ours — this is the OPEN §15.5
+    // exhausted-log rule's accounting (R3-995 settles it); in-force §3.8 counts every received
+    // batch. Away from the ceiling the two readings cannot diverge in effect: a replica's own
+    // lamport only orders its own batches, and §3.8 breaks cross-replica ties by actor.
     if (r.body) this.lamportMax = Math.max(this.lamportMax, r.body.lamport);
     if (!r.body) {
       this.states.set(r.key, 'invalid');
