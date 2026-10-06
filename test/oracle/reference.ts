@@ -64,6 +64,16 @@ export interface OracleResult {
   readonly frozen: { reason: string; at: string } | null;
   readonly publishFiles: Map<string, string>;
   readonly trailers: string[];
+  /** §15.7 rendering of the effective state, as ids. */
+  readonly rendered: {
+    columns: Array<{ id: string; cards: string[] }>;
+    unsorted: string[];
+    archivedColumns: string[];
+    deletedColumns: string[];
+    archivedCards: string[];
+    deletedCards: string[];
+    orphans: string[];
+  };
 }
 
 // ---- small helpers, local on purpose --------------------------------------------------------
@@ -235,6 +245,7 @@ interface SnapRec {
   set: RecordSet;
   base: Record<string, Json> | null;
   exists: boolean;
+  touched: boolean;
   values: Map<string, Json>;
   pendingFrom: Map<string, Op>;
 }
@@ -272,9 +283,10 @@ function Snap(layout: Layout, tree: ReadonlyMap<string, string>, S: Op[], status
     const mine = S.filter((op) => op.path === path);
     const notSuperseded = (op: Op) => status(op).kind !== 'superseded';
 
-    // Existence (§15.3): parses at the base, or a non-superseded create batch for it is in S.
+    // Existence (§15.3): parses at the base, or a create batch for it in S whose operations on it
+    // are all pending at P.
     const createBatchKeys = [...new Set(mine.filter((op) => op.create).map((op) => op.batch.key))];
-    const liveCreate = createBatchKeys.some((k) => mine.filter((op) => op.batch.key === k).every(notSuperseded));
+    const liveCreate = createBatchKeys.some((k) => mine.filter((op) => op.batch.key === k).every((op) => status(op).kind === 'pending'));
     const exists = base !== null || liveCreate;
 
     const groupNames = new Set<string>(nonMapGroups(set));
@@ -306,7 +318,7 @@ function Snap(layout: Layout, tree: ReadonlyMap<string, string>, S: Op[], status
         pendingFrom.set(g, w);
       } else values.set(g, fromBase);
     }
-    out.set(path, { set, base, exists, values, pendingFrom });
+    out.set(path, { set, base, exists, touched: mine.length > 0, values, pendingFrom });
   }
   return out;
 }
@@ -468,7 +480,7 @@ export function oracle(input: OracleInput): OracleResult {
     if (!rec.exists) continue;
     for (const [g, op] of rec.pendingFrom) {
       const atBase = normalizeGroup(rec.set, resolveGroup(rec.set, g)!, rec.base);
-      if (rec.base === null || canonicalJson(rec.values.get(g)!) !== canonicalJson(atBase)) pending.push(op.id);
+      if (canonicalJson(rec.values.get(g)!) !== canonicalJson(atBase)) pending.push(op.id);
     }
   }
   pending.sort(order);
@@ -487,7 +499,7 @@ export function oracle(input: OracleInput): OracleResult {
       let differs = rec.base === null;
       for (const [g, op] of rec.pendingFrom) {
         const atBase = normalizeGroup(rec.set, resolveGroup(rec.set, g)!, rec.base);
-        if (rec.base === null || canonicalJson(rec.values.get(g)!) !== canonicalJson(atBase)) {
+        if (canonicalJson(rec.values.get(g)!) !== canonicalJson(atBase)) {
           differs = true;
           authors.add(op.batch.actor.split('.')[0]);
         }
@@ -504,6 +516,7 @@ export function oracle(input: OracleInput): OracleResult {
   }
 
   return {
+    rendered: render(eff),
     adopted: chain.map((c) => c.commit.sha),
     states,
     statuses: new Map(ops.map((op) => [op.id, statusOf(op)])),
@@ -514,5 +527,50 @@ export function oracle(input: OracleInput): OracleResult {
     frozen,
     publishFiles: publishFilesMap,
     trailers,
+  };
+}
+
+// ---- §15.7 rendering --------------------------------------------------------------------------
+
+function render(eff: Map<string, SnapRec>): OracleResult['rendered'] {
+  type Row = { id: string; order: string; archived: boolean; deleted: boolean; column: string | null };
+  const cols: Row[] = [];
+  const cards: Row[] = [];
+  const orphans: string[] = [];
+  for (const [path, rec] of eff) {
+    if (!rec.exists) {
+      if (rec.touched) orphans.push(path);
+      continue;
+    }
+    const id = path.slice(path.lastIndexOf('/') + 1, path.lastIndexOf('.'));
+    const flag = (g: string) => rec.values.get(g) === true;
+    if (rec.set.name === 'columns') {
+      const o = rec.values.get('order');
+      cols.push({ id, order: typeof o === 'string' ? o : '', archived: flag('archived'), deleted: flag('deleted'), column: null });
+    } else if (rec.set.name === 'cards') {
+      const pos = (rec.values.get('position') ?? {}) as { column?: Json; order?: Json };
+      cards.push({
+        id,
+        order: typeof pos.order === 'string' ? pos.order : '',
+        archived: flag('archived'),
+        deleted: flag('deleted'),
+        column: typeof pos.column === 'string' ? pos.column : null,
+      });
+    }
+  }
+  const sortRows = (rows: Row[]) => rows.sort((a, b) => order(a.order, b.order) || order(a.id, b.id));
+  sortRows(cols);
+  sortRows(cards);
+  const shown = cols.filter((c) => !c.deleted && !c.archived);
+  const live = cards.filter((c) => !c.deleted && !c.archived);
+  const shownIds = shown.map((c) => c.id);
+  return {
+    columns: shown.map((c) => ({ id: c.id, cards: live.filter((x) => x.column === c.id).map((x) => x.id) })),
+    unsorted: live.filter((x) => x.column === null || !shownIds.includes(x.column)).map((x) => x.id),
+    archivedColumns: cols.filter((c) => c.archived && !c.deleted).map((c) => c.id),
+    deletedColumns: cols.filter((c) => c.deleted).map((c) => c.id),
+    archivedCards: cards.filter((c) => c.archived && !c.deleted).map((c) => c.id),
+    deletedCards: cards.filter((c) => c.deleted).map((c) => c.id),
+    orphans: orphans.sort(order),
   };
 }

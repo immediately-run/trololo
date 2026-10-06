@@ -30,9 +30,7 @@ export async function sendTo(w: World, from: Replica, to: Replica): Promise<void
   w.write(from);
   w.resolve(from);
   const mine = to.inbox.filter((p) => p.startsWith(`batches/${from.engine.actor}/`));
-  to.inbox = to.inbox.filter((p) => !mine.includes(p));
-  for (const p of mine) await to.engine.receive(p, w.space.get(p)!);
-  w.collect(to);
+  for (const p of mine) await w.receiveNow(to, p);
 }
 
 /** Writes and resolves a replica's outbox without delivering it anywhere yet. */

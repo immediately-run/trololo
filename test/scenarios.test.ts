@@ -3,7 +3,7 @@
 // replica and against the oracle.
 
 import { describe, expect, it } from 'vitest';
-import { compareOrder, type BatchBody } from '../src/lib/session/batch';
+import type { BatchBody } from '../src/lib/session/batch';
 import { FrozenError } from '../src/lib/session/engine';
 import { flush, outsideEdit, place, sendTo, settle, titleOf } from './sim/helpers';
 import { CARDS, COLUMNS, World, type Replica } from './sim/world';
@@ -25,8 +25,8 @@ describe('§15.9 scenarios', () => {
     const ba = body((await a.engine.moveCard(X, C2, 0)).bytes);
     const bb = body((await b.engine.moveCard(X, C3, 0)).bytes);
     await settle(w);
-    const key = (x: BatchBody) => ({ lamport: x.lamport, actor: x.actor, seq: x.seq, index: 0 });
-    const winner = compareOrder(key(ba), key(bb)) > 0 ? ba : bb;
+    // §3.8: the greater (lamport, actor by code unit) wins — computed here, not by the engine.
+    const winner = ba.lamport !== bb.lamport ? (ba.lamport > bb.lamport ? ba : bb) : ba.actor > bb.actor ? ba : bb;
     const pos = winner.ops[0].value as { column: string; order: string };
     for (const r of [a, b]) {
       const p = place(r.engine, X)!;
@@ -166,9 +166,12 @@ describe('§15.9 scenarios', () => {
     await w.sync(b);
     expect(b.engine.offeredChain()).toHaveLength(2);
     expect(b.engine.adoptedChain()).toHaveLength(1); // §5.4 (a): waits
+    expect(titleOf(b.engine, X)).toBe('Card 1');
     w.check(b);
     await w.deliver(b, Infinity);
     expect(b.engine.adoptedChain()).toHaveLength(2);
+    expect(titleOf(b.engine, X)).toBe('Published early');
+    expect(b.engine.superseded()).toEqual([]);
     await settle(w);
     for (const r of [a, b]) {
       expect(titleOf(r.engine, X)).toBe('Published early');
@@ -192,13 +195,21 @@ describe('§15.9 scenarios', () => {
   });
 
   it('S12 — a cancelled publish dialog changes nothing', async () => {
-    const [w, a] = await world(112, 'ana');
-    await a.engine.renameCard(X, 'Kept pending');
-    flush(w, a);
-    const before = { pending: a.engine.pending(), plan: await a.engine.publishPlan() };
-    // The contribute task resolves `cancelled`: the app does nothing.
-    expect({ pending: a.engine.pending(), plan: await a.engine.publishPlan() }).toEqual(before);
-    expect(before.pending).toHaveLength(1);
+    const [w, a, b] = await world(112, 'ana', 'ben');
+    const op = (await a.engine.renameCard(X, 'Kept pending')).bytes;
+    await settle(w);
+    const before = { pending: a.engine.pending(), statuses: [...a.engine.statuses()] };
+    const plan = (await a.engine.publishPlan())!; // the dialog opens on this plan…
+    expect(plan.needed).toBe(true);
+    // …and the contribute task resolves `cancelled`: nothing is written or sent.
+    expect(a.engine.takeOutbox()).toEqual([]);
+    expect(w.git.main).toBe(w.root);
+    await b.engine.renameCard(Y, 'Other activity meanwhile');
+    await settle(w);
+    expect(a.engine.pending().filter((p) => p.path === `cards/${X}.json`)).toEqual(before.pending);
+    expect(a.engine.statuses().get(`${JSON.parse(new TextDecoder().decode(op)).actor}/1/0`)).toEqual(before.statuses[0][1]);
+    expect(await w.publish(a)).toBe('published'); // a later publish still lands it
+    expect(JSON.parse(w.git.tree().get(`cards/${X}.json`)!).title).toBe('Kept pending');
     await settle(w);
   });
 

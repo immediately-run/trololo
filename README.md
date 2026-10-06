@@ -25,7 +25,7 @@ The **session engine** — a pure library with no platform dependency — and th
 | `src/lib/session/engine.ts` | The façade the app calls: receive, adopt, issue, publish plan, the typed board operations. |
 | `src/lib/session/ports.ts` | `HistoryPort` (the §16 history verbs), the injected hash and clock. |
 | `test/oracle/reference.ts` | An independent oracle transcribed from the spec; it shares only `layout.ts` and `canonical.ts`. |
-| `test/sim/` | Simulated git (merges, squashes, force-pushes), a session space with delayed, duplicated and reordered delivery, replicas with outboxes. Publish commits are built by the **oracle**. |
+| `test/sim/` | Simulated git (merges, squashes, force-pushes, merges that move the old head off the first-parent chain), a session space with delayed, duplicated and reordered delivery, replicas with outboxes. The world records each replica's view itself (batches seen, acknowledgements, synced head) and feeds that — not the engine's own record — to the oracle; publish commits are built by the **oracle**. |
 
 The board UI, the platform wiring (`HistoryPort` over the history verbs, the session space, the
 `contribute` task) and descriptions arrive in R3-970 and R3-973.

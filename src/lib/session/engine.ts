@@ -12,6 +12,7 @@ import {
   contentValidity,
   CONTROL_PREFIX,
   decodeBatch,
+  LAMPORT_LIMIT,
   encodeBatch,
   opId,
   parseBatchPath,
@@ -25,7 +26,7 @@ import { boardView, type BoardView } from './effective';
 import { Fold, type AppliedOp, type Board, type Status } from './fold';
 import { keyForDrop, rebalancedKeys, type RandomInt } from './fracKey';
 import { layoutFromMarker, MARKER_PATH, matchPath, resolveGroup, type Layout, type RecordSet } from './layout';
-import type { ChainCommit, Clock, Hash, HistoryPort } from './ports';
+import type { ChainCommit, Clock, Hash, HistoryPort, LogEntry } from './ports';
 import {
   buildTrailers,
   commitMessage,
@@ -92,6 +93,8 @@ export class RebalanceNeeded extends Error {
 }
 
 const ID_DIGITS = '0123456789abcdefghijklmnopqrstuvwxyz';
+/** How far `sync` walks first parents looking for a known commit before calling it a rewrite. */
+const MAX_WALK = 10_000;
 
 export class SessionEngine {
   readonly sessionId: string;
@@ -113,6 +116,7 @@ export class SessionEngine {
   private ownPrev = '';
   private logRead = false;
   private readonly freezeIssued = new Set<FreezeReason>();
+  private deferredFreezes: Frozen[] = [];
   private outbox: OutgoingBatch[] = [];
   private readonly dismissed = new Set<string>();
   private lock: Promise<unknown> = Promise.resolve();
@@ -138,8 +142,15 @@ export class SessionEngine {
   // ---- inputs ------------------------------------------------------------------------------
 
   /** The session log has been read once in full; batches may now be issued (§3.8). */
-  markLogRead(): void {
-    this.logRead = true;
+  markLogRead(): Promise<void> {
+    return this.exclusive(async () => {
+      this.logRead = true;
+      // Conditions found while reading (an integrity failure, a layout change) freeze now.
+      const deferred = this.deferredFreezes;
+      this.deferredFreezes = [];
+      for (const f of deferred) await this.freeze(f.reason, f.at);
+      await this.settle();
+    });
   }
 
   /** A batch file read from the session log (acknowledged by having been read). */
@@ -170,49 +181,49 @@ export class SessionEngine {
     return this.exclusive(async () => {
       if (!this.logRead) return; // a freeze may be needed, and nothing can be written yet
       const head = await history.head();
-      const lastKnown = this.offered[this.offered.length - 1].sha;
-      if (head === lastKnown) return;
-      if (!(await history.isAncestor(lastKnown, head))) {
-        if (await history.isAncestor(this.fold.head.sha, head)) {
-          // Only commits we had not adopted yet were rewritten: forget them.
-          this.offered = this.offered.slice(0, this.fold.chain.length);
-        } else {
-          // §15.7: a main-line rewrite freezes the session at the merge base on our chain.
-          let m = 0;
-          for (let i = this.fold.chain.length - 1; i > 0; i--) {
-            if (await history.isAncestor(this.fold.chain[i].sha, head)) {
-              m = i;
-              break;
-            }
-          }
-          // Freeze (unless a stop is already in force), and in every case drop what the rewrite
-          // removed: back to the merge base, then follow the new main line up to the freeze point.
-          await this.freeze('rewrite', this.fold.chain[m].sha);
-          this.rollbackTo(m);
-          this.offered = this.offered.slice(0, m + 1);
-        }
-      }
-      const from = this.offered[this.offered.length - 1].sha;
-      const fresh = [];
+      if (head === this.offered[this.offered.length - 1].sha) return;
+      // Walk the head's first-parent chain (§5.3) back to a commit we were already offered.
+      const known = new Map(this.offered.map((c, i) => [c.sha, i]));
+      const fresh: LogEntry[] = [];
+      let k = -1;
       let cursor: string | null = head;
-      while (cursor !== null && cursor !== from) {
+      walk: while (cursor !== null && fresh.length < MAX_WALK) {
         const page = await history.log(cursor, 100);
         if (page.length === 0) break;
         for (const e of page) {
-          if (e.sha === from) {
-            cursor = null;
-            break;
+          const i = known.get(e.sha);
+          if (i !== undefined) {
+            k = i;
+            break walk;
           }
           fresh.push(e);
           cursor = e.parent;
         }
       }
+      const adopted = this.fold.chain.length - 1;
+      if (k < adopted) {
+        // §15.7: the head no longer has our adopted base on its first-parent chain — a rewrite
+        // (a force-push, or a merge whose first parent skips it). Freeze at the last adopted base
+        // still on the chain (unless a stop is already in force) and, in every case, drop what the
+        // rewrite removed: back to that base, then follow the new chain up to the freeze point.
+        const m = Math.max(k, 0);
+        await this.freeze('rewrite', this.fold.chain[m].sha);
+        this.rollbackTo(m);
+        if (k < 0) {
+          // Not even the start base is on the chain within reach: nothing new can follow it.
+          this.offered = this.offered.slice(0, 1);
+          await this.settle();
+          return;
+        }
+      }
+      this.offered = this.offered.slice(0, k + 1); // forget unadopted commits the rewrite removed
       for (const e of fresh.reverse()) {
         this.pushOffered({ sha: e.sha, parent: e.parent, message: e.message, tree: await history.read(e.sha) });
       }
       await this.settle();
     });
   }
+
 
   // ---- outputs -----------------------------------------------------------------------------
 
@@ -300,7 +311,8 @@ export class SessionEngine {
     for (const rec of this.fold.effective().values()) {
       if (!rec.exists) continue;
       for (const [g, op] of rec.from) {
-        if (rec.base !== null && sameValue(op.value, normalizeGroup(rec.set, resolveGroup(rec.set, g)!, rec.base))) continue;
+        // Satisfied (IM-10): equal to the base, or to the absent value for a record new at the base.
+        if (sameValue(op.value, normalizeGroup(rec.set, resolveGroup(rec.set, g)!, rec.base))) continue;
         out.push({ id: op.id, actor: op.actor, path: op.path, group: op.group, value: op.value });
       }
     }
@@ -655,7 +667,11 @@ export class SessionEngine {
   private async freeze(reason: FreezeReason, at: string): Promise<void> {
     const f = this.frozen();
     // Idempotent (§15.5): once per replica, unless a layout freeze is overtaken by one that stops the chain.
-    if (!this.logRead || this.freezeIssued.has(reason) || stopsChain(f) || (f !== null && reason === 'layout')) return;
+    if (!this.logRead) {
+      this.deferredFreezes.push({ reason, at });
+      return;
+    }
+    if (this.freezeIssued.has(reason) || stopsChain(f) || (f !== null && reason === 'layout')) return;
     this.freezeIssued.add(reason);
     await this.issueUnlocked([frozenOp(reason, at)]);
   }
@@ -665,6 +681,7 @@ export class SessionEngine {
     const content = ops.some((op) => !op.path.startsWith(CONTROL_PREFIX));
     if (content && this.frozen() !== null) throw new FrozenError(`the session is frozen (${this.frozen()!.reason})`);
     const seq = this.ownSeq + 1;
+    if (this.lamportMax + 1 >= LAMPORT_LIMIT) throw new Error('the lamport space is exhausted; restart the session');
     const body: BatchBody = {
       v: BATCH_VERSION,
       actor: this.actor,

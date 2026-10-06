@@ -107,7 +107,9 @@ export function snap(
     const createBatches = new Map<string, boolean>();
     for (const op of pathOps) {
       if (!op.create) continue;
-      const ok = statusAtP(op).kind !== 'superseded';
+      // A create batch makes the record exist only while every operation of it is pending at P:
+      // once published, the file at the base speaks (an outside delete of it wins).
+      const ok = statusAtP(op).kind === 'pending';
       createBatches.set(op.batch, (createBatches.get(op.batch) ?? true) && ok);
     }
     const exists = base !== null || [...createBatches.values()].some((ok) => ok);

@@ -69,24 +69,27 @@ describe('pass-2 counterexamples', () => {
   });
 
   it('P2-2 (ii) — a gap in the publisher vector: a later edit still wins by order, not by supersession', async () => {
-    const [w, a, b] = await world(203, 'ana', 'ben');
-    const a1 = await a.engine.renameCard(X, 'a:1');
+    const [w, a, b, c] = await world(203, 'ana', 'ben', 'cy');
+    await a.engine.renameCard(X, 'a:1');
     const a2 = await a.engine.renameCard(X, 'a:2 (lamport 30 in the review)');
     flush(w, a);
-    // Ben receives a:2 but not a:1: a gap. His publish vector for Ana is empty.
-    await b.engine.receive(a2.path, a2.bytes);
-    b.inbox = b.inbox.filter((p) => p !== a2.path);
+    // Ben and Cy receive a:2 but not a:1: a gap. Ben's publish vector for Ana is empty.
+    await w.receiveNow(b, a2.path);
+    await w.receiveNow(c, a2.path);
     expect(b.engine.publishVector().get(a.engine.actor)).toBeUndefined();
     await b.engine.renameCard(Y, 'Ben publishes this');
     flush(w, b);
     expect(await w.publish(b)).toBe('published');
-    // Made after the snapshot, with a greater lamport than a:2.
-    const later = id((await b.engine.renameCard(X, 'b after the snapshot')).bytes);
+    // Cy has not adopted Ben's publish: her edit is based before B, after the snapshot, with a
+    // greater lamport than a:2 (lamport 40 in the review).
+    const later = await c.engine.renameCard(X, 'c after the snapshot');
+    const laterBody = JSON.parse(new TextDecoder().decode(later.bytes)) as BatchBody;
+    expect(laterBody.base).not.toBe(w.git.main);
+    expect(laterBody.lamport).toBeGreaterThan(JSON.parse(new TextDecoder().decode(a2.bytes)).lamport);
     await settle(w);
-    void a1;
-    for (const r of [a, b]) {
-      expect(titleOf(r.engine, X)).toBe('b after the snapshot');
-      expect(r.engine.statuses().get(later)?.kind).toBe('pending');
+    for (const r of [a, b, c]) {
+      expect(titleOf(r.engine, X)).toBe('c after the snapshot');
+      expect(r.engine.statuses().get(id(later.bytes))?.kind).toBe('pending');
       expect(r.engine.superseded()).toEqual([]);
     }
   });

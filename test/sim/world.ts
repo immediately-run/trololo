@@ -71,6 +71,14 @@ export class Replica {
   journal: OutgoingBatch[] = [];
   unresolved: string[] = [];
   inbox: string[] = [];
+  /**
+   * The world's own record of this replica's view, kept independently of the engine for the
+   * oracle: the first bytes it saw at each path, which of them are acknowledged, and the main-line
+   * head it last synced.
+   */
+  seen = new Map<string, Uint8Array>();
+  acked = new Set<string>();
+  syncedHead = '';
 
   constructor(name: string, login: string, engine: SessionEngine) {
     this.name = name;
@@ -90,6 +98,8 @@ export class World {
   checks = 0;
   publishes = 0;
   conflicts = 0;
+  merges = 0;
+  reloads = 0;
 
   constructor(seed: number, tree: Tree = startTree()) {
     this.rng = seeded(seed);
@@ -130,9 +140,13 @@ export class World {
       random: (n) => this.int(n),
     });
     const r = new Replica(`r${this.replicas.length}`, login, engine);
-    for (const [path, bytes] of this.space) await engine.receive(path, bytes);
-    engine.markLogRead();
+    for (const [path, bytes] of this.space) {
+      await engine.receive(path, bytes);
+      this.see(r, path, bytes, true);
+    }
+    await engine.markLogRead();
     await engine.sync(this.git);
+    r.syncedHead = this.git.main;
     this.collect(r);
     this.replicas.push(r);
     return r;
@@ -147,10 +161,21 @@ export class World {
     r.journal = [...journal, ...fresh.journal];
     r.unresolved = [];
     r.inbox = [];
+    r.seen = fresh.seen;
+    r.acked = fresh.acked;
+    r.syncedHead = fresh.syncedHead;
+    this.reloads++;
+  }
+
+  see(r: Replica, path: string, bytes: Uint8Array, acked: boolean): void {
+    if (!r.seen.has(path)) r.seen.set(path, bytes);
+    if (acked) r.acked.add(path);
   }
 
   collect(r: Replica): void {
-    r.journal.push(...r.engine.takeOutbox());
+    const out = r.engine.takeOutbox();
+    for (const b of out) this.see(r, b.path, b.bytes, false);
+    r.journal.push(...out);
   }
 
   /** Space writes of the journal (create-only); each becomes visible to every other replica. */
@@ -175,8 +200,19 @@ export class World {
   /** The writes resolve: acknowledgement (§15.5). */
   resolve(r: Replica): void {
     if (!r.online) return;
-    for (const p of r.unresolved) r.engine.acknowledge(p);
+    for (const p of r.unresolved) {
+      r.engine.acknowledge(p);
+      r.acked.add(p);
+    }
     r.unresolved = [];
+  }
+
+  /** Delivers one batch file from the space to `r` now (out of band of its inbox). */
+  async receiveNow(r: Replica, path: string, bytes = this.space.get(path)!): Promise<void> {
+    r.inbox = r.inbox.filter((p) => p !== path);
+    await r.engine.receive(path, bytes);
+    this.see(r, path, bytes, true);
+    this.collect(r);
   }
 
   /** Delivers up to `k` batch files in random order, sometimes leaving a duplicate behind. */
@@ -187,6 +223,7 @@ export class World {
       const path = r.inbox[j];
       if (this.rng() >= 0.15) r.inbox.splice(j, 1);
       await r.engine.receive(path, this.space.get(path)!);
+      this.see(r, path, this.space.get(path)!, true);
     }
     this.collect(r);
   }
@@ -194,7 +231,15 @@ export class World {
   async sync(r: Replica): Promise<void> {
     if (!r.online) return;
     await r.engine.sync(this.git);
+    r.syncedHead = this.git.main;
     this.collect(r);
+  }
+
+  /** The first-parent chain of `head`, root first — computed from simulated git, not the engine. */
+  firstParentChain(head: string): ChainCommit[] {
+    const out: ChainCommit[] = [];
+    for (let s: string | undefined = head; s !== undefined; s = this.git.commits.get(s)!.parents[0]) out.push(this.commitOf(s));
+    return out.reverse();
   }
 
   /** The oracle's view of one replica. */
@@ -202,8 +247,8 @@ export class World {
     return oracle({
       layout: LAYOUT,
       sessionId: SESSION_ID,
-      offered: r.engine.offeredChain(),
-      batches: r.engine.received(),
+      offered: this.firstParentChain(r.syncedHead),
+      batches: [...r.seen].map(([path, bytes]) => ({ path, bytes, acked: r.acked.has(path) })),
     });
   }
 
@@ -245,6 +290,7 @@ export class World {
     const o = this.oracleOf(r);
     const e = r.engine;
     const where = `replica ${r.name}`;
+    assert.deepEqual(e.offeredChain().map((c) => c.sha), this.firstParentChain(r.syncedHead).map((c) => c.sha), `${where}: offered chain`);
     assert.deepEqual(e.adoptedChain(), o.adopted, `${where}: adopted chain`);
     assert.deepEqual(e.frozen(), o.frozen, `${where}: frozen`);
     assert.deepEqual(vec(e.holdingVector()), vec(o.holding), `${where}: holding vector`);
@@ -256,6 +302,20 @@ export class World {
     assert.deepEqual(statuses(e.statuses()), statuses(o.statuses), `${where}: statuses`);
     assert.deepEqual(boardOf(e.effectiveBoard()), oracleBoard(o), `${where}: effective state`);
     assert.deepEqual(e.pending().map((p) => p.id).sort(cmp), o.pending, `${where}: effective-pending`);
+    const v = e.view();
+    assert.deepEqual(
+      {
+        columns: v.columns.map((c) => ({ id: c.id, cards: c.cards.map((x) => x.id) })),
+        unsorted: v.unsorted.map((c) => c.id),
+        archivedColumns: v.archivedColumns.map((c) => c.id),
+        deletedColumns: v.deletedColumns.map((c) => c.id),
+        archivedCards: v.archivedCards.map((c) => c.id),
+        deletedCards: v.deletedCards.map((c) => c.id),
+        orphans: [...v.orphans],
+      },
+      o.rendered,
+      `${where}: rendered board`,
+    );
   }
 
   /** Brings everyone online and runs the network and history to a fixed point. */
@@ -408,6 +468,11 @@ export class World {
       obj.title = `Merged title ${this.int(99)}`;
       tree.set(path, json(obj));
       this.git.merge(tree, tree, 'Merge pull request #1');
+      this.merges++;
+      return;
+    } else if (k === 11 && this.rng() < 0.5) {
+      tree.set('README.md', `# Squashed ${this.int(99)}\n`);
+      this.git.squash(tree, 'Squash merge of a pull request');
       return;
     } else if (k === 10) {
       // A commit carrying another session's trailers is an outside change for this one.
@@ -431,14 +496,20 @@ export class World {
     this.git.advance(tree, 'Change the layout');
   }
 
-  /** A force-push: `main` drops its newest commit and gains another. */
+  /**
+   * A rewrite of the main line: either a force-push (`main` drops its newest commit and gains
+   * another) or a merge whose FIRST parent is another line, so the old head is reachable only
+   * through the second parent and leaves the first-parent chain (§5.3).
+   */
   forcePush(): void {
     const head = this.git.commits.get(this.git.main)!;
     if (head.parents.length === 0) return;
     const base = head.parents[0];
     const tree = new Map(this.git.tree(base));
     tree.set('README.md', `# Rewritten ${this.int(99)}\n`);
-    this.git.forcePush(this.git.commit([base], tree, 'Rewritten history'));
+    const other = this.git.commit([base], tree, 'Rewritten history');
+    if (this.rng() < 0.5) this.git.forcePush(other);
+    else this.git.forcePush(this.git.commit([other, head.sha], tree, 'Merge main into a side line, pushed as main'));
   }
 }
 

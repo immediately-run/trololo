@@ -46,6 +46,11 @@ export class SimGit implements HistoryPort {
     return this.main;
   }
 
+  /** A squash merge: one ordinary commit on `main` carrying a whole branch's changes. */
+  squash(tree: Tree, message: string): string {
+    return this.advance(tree, message);
+  }
+
   /** A force-push: `main` jumps to `sha` (usually an ancestor plus new commits). */
   forcePush(sha: string): void {
     this.main = sha;

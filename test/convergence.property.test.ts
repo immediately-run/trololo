@@ -22,14 +22,28 @@ const PINNED: Array<{ seed: number; replicas: number; actions: number[] }> = [
   { seed: 1879047932, replicas: 2, actions: [0, 81, 93, 73, 0, 65, 93, 0, 65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
 ];
 
-async function run(seed: number, replicas: number, actions: number[]): Promise<World> {
+interface Coverage {
+  publishes: number;
+  conflicts: number;
+  merges: number;
+  reloads: number;
+  supersededRuns: number;
+  unfrozenRuns: number;
+  frozenRuns: number;
+}
+
+async function run(seed: number, replicas: number, actions: number[], cov?: Coverage): Promise<World> {
   const w = new World(seed);
   const logins = ['ana', 'ben', 'cy', 'dee', 'eli'];
   const rs: Replica[] = [];
   for (let i = 0; i < replicas; i++) rs.push(await w.join(logins[i]));
 
-  for (const a of actions) {
+  // A layout change or a rewrite freezes the session for good; keep at most one per run, in the
+  // last third, so most of a run exercises a live session.
+  let freezer = false;
+  for (const [i, a] of actions.entries()) {
     const r = rs[w.int(rs.length)];
+    const late = i >= (actions.length * 2) / 3;
     if (a < 30) await w.edit(r);
     else if (a < 42) w.write(r);
     else if (a < 50) w.resolve(r);
@@ -46,13 +60,27 @@ async function run(seed: number, replicas: number, actions: number[]): Promise<W
     }
     else if (a < 91) r.online = !r.online;
     else if (a === 91) await w.reload(r);
-    else if (a === 92) w.layoutChange();
-    else if (a === 93) w.forcePush();
+    else if (a === 92 || a === 93) {
+      if (late && !freezer) {
+        freezer = true;
+        if (a === 92) w.layoutChange();
+        else w.forcePush();
+      } else await w.deliver(r, Infinity);
+    }
     else await w.deliver(r, Infinity);
     w.check(r);
   }
   await w.quiesce();
   w.checkConverged();
+  if (cov) {
+    cov.publishes += w.publishes;
+    cov.conflicts += w.conflicts;
+    cov.merges += w.merges;
+    cov.reloads += w.reloads;
+    if (rs.some((r) => r.engine.superseded().length > 0)) cov.supersededRuns++;
+    if (rs[0].engine.frozen() === null) cov.unfrozenRuns++;
+    else cov.frozenRuns++;
+  }
   return w;
 }
 
@@ -62,8 +90,7 @@ describe('convergence', () => {
   });
 
   it(`random sessions converge to the oracle (${RUNS} runs)`, async () => {
-    let checks = 0;
-    let publishes = 0;
+    const cov: Coverage = { publishes: 0, conflicts: 0, merges: 0, reloads: 0, supersededRuns: 0, unfrozenRuns: 0, frozenRuns: 0 };
     await fc.assert(
       fc.asyncProperty(
         fc.integer({ min: 1, max: 2 ** 31 - 1 }),
@@ -71,15 +98,20 @@ describe('convergence', () => {
         // Layout changes and force-pushes (92, 93) are rare: one in a hundred actions each.
         fc.array(fc.nat({ max: 99 }), { minLength: 20, maxLength: 90, size: 'max' }),
         async (seed, replicas, actions) => {
-          const w = await run(seed, replicas, actions);
-          checks += w.checks;
-          publishes += w.publishes;
+          await run(seed, replicas, actions, cov);
         },
       ),
       { numRuns: RUNS },
     );
-    // The suite must actually exercise the machinery it claims to.
-    expect(checks).toBeGreaterThan(RUNS * 10);
-    expect(publishes).toBeGreaterThan(RUNS / 4);
+    // The suite must actually exercise the machinery it claims to (floors well below what a
+    // normal run reaches, so a regression in the generator fails loudly).
+    expect(cov.publishes).toBeGreaterThan(RUNS / 4);
+    expect(cov.conflicts).toBeGreaterThan(RUNS / 10);
+    expect(cov.merges).toBeGreaterThan(RUNS / 10);
+    expect(cov.reloads).toBeGreaterThan(RUNS / 20);
+    expect(cov.supersededRuns).toBeGreaterThan(RUNS / 10);
+    expect(cov.unfrozenRuns).toBeGreaterThan(RUNS / 2);
+    expect(cov.frozenRuns).toBeGreaterThan(RUNS / 50);
+    console.info('convergence coverage', cov);
   });
 });

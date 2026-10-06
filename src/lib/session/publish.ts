@@ -41,7 +41,7 @@ export function publishAuthors(board: Board): string[] {
     if (!rec.exists) continue;
     for (const [g, op] of rec.from) {
       const atBase = normalizeGroup(rec.set, resolveGroup(rec.set, g)!, rec.base);
-      if (rec.base === null || !sameValue(op.value, atBase)) logins.add(actorLogin(op.actor));
+      if (!sameValue(op.value, atBase)) logins.add(actorLogin(op.actor));
     }
   }
   return [...logins].sort(cmp);
